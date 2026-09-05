@@ -41,21 +41,17 @@ AppImage.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/hpolthof/omarchy-appimages.git
-omarchy plugin enable io.github.hpolthof.appimages --section right
+omarchy plugin add https://github.com/hpolthof/omarchy-appimages.git --enable
 ```
 
-The bar widget is enabled by the second command. The folder watcher is a
-separate `service` kind, which Omarchy enables by plugin id — add it to the
-`plugins` array in `~/.config/omarchy/shell.json`:
+That is the whole install. The folder watcher is a separate `service` kind, but
+Omarchy counts the plugin as enabled once the widget is placed, so it starts
+along with it and survives a restart — there is nothing to add to
+`shell.json` by hand.
 
-```json
-{
-  "plugins": [
-    { "id": "io.github.hpolthof.appimages" }
-  ]
-}
-```
+In an interactive terminal `--enable` asks which bar section to use; otherwise
+it takes the manifest's default, which is the right-hand section. Move it later
+with `omarchy bar move io.github.hpolthof.appimages --section left`.
 
 ### Dependencies
 
@@ -122,12 +118,11 @@ makes the call a no-op instead of an error when the shell is not running.
 ## Removing it
 
 ```bash
-omarchy plugin disable io.github.hpolthof.appimages
 omarchy plugin remove io.github.hpolthof.appimages
 ```
 
-Then drop the plugin id from the `plugins` array in
-`~/.config/omarchy/shell.json`, and clear what it generated:
+That takes the widget out of the bar and stops the watcher with it. Then clear
+what it generated:
 
 ```bash
 rm -f ~/.local/share/applications/appimage-*.desktop
