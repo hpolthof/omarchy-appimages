@@ -1,0 +1,465 @@
+#!/bin/bash
+
+# Backend for the Omarchy AppImages plugin: keeps ~/AppImage and the desktop
+# launcher in sync, and owns the per-AppImage overrides.
+#
+#   appimages sync [--quiet]      Regenerate desktop entries (idempotent)
+#   appimages list                Emit one TSV row per AppImage, for the panel
+#   appimages dir                 Print the watched directory
+#   appimages rename [id] [name]  Set a launcher name; empty name resets it
+#   appimages hide [id] [on|off]  Keep an AppImage out of the launcher
+#   appimages run <id>            Launch it, reporting a start that fails
+#   appimages focus <id>          Focus its window if one is open
+#   appimages delete <id>         Delete the AppImage file itself
+#   appimages menu                Interactive front-end for the above
+#
+# Names, icons, categories and mime types come from the desktop entry embedded
+# in the AppImage itself. Overrides live in appimages.json and survive both a
+# re-sync and a new version of the AppImage.
+
+set -euo pipefail
+
+CONFIG="${APPIMAGE_CONFIG:-$HOME/.config/omarchy/appimages.json}"
+DESKTOP_DIR="$HOME/.local/share/applications"
+STATE_DIR="$HOME/.local/state/appimages"
+PREFIX="appimage-"
+GLYPH="󰏖"
+
+notify() { command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g "$GLYPH" "$1" "${2:-}" || true; }
+
+titleize() { printf '%s' "$1" | sed 's/[-_.]\+/ /g; s/\b\(.\)/\u\1/g'; }
+
+# The id keys a launcher entry, a state directory and a config override, so it
+# has to be stable for a given filename and distinct between filenames. Case
+# and separators are kept rather than folded away: lowercasing Test-Tool and
+# test_tool onto one slug made them share a launcher entry and re-extract each
+# other's icon on every sync.
+id_for() {
+  printf '%s' "$(basename "$1")" \
+    | sed 's/\.[Aa]pp[Ii]mage$//' \
+    | tr -c 'A-Za-z0-9._-' '-' \
+    | sed 's/-\{2,\}/-/g; s/^[-.]*//; s/-*$//'
+}
+
+# Read one key out of a desktop file's [Desktop Entry] section.
+entry_get() { [[ -f $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }
+
+# Every localized variant of a key, as whole "Key[nl]=value" lines. The
+# launcher searches GenericName, Comment and Keywords, so dropping their
+# translations would make an app findable in English only.
+entry_get_localized() { [[ -f $1 ]] || return 0; grep -E "^$2\[[^]]+\]=" "$1" || true; }
+
+# The body of one [Desktop Action x] group, without its header.
+entry_action_block() {
+  [[ -f $1 ]] || return 0
+  awk -v group="[Desktop Action $2]" '$0 == group { inside = 1; next } /^\[/ { inside = 0 } inside' "$1"
+}
+
+# An AppImage's own Exec calls AppRun, or a binary inside the image; neither
+# exists once the entry lives outside it. Keep everything the AppImage put
+# after that first token -- flags it needs, and the %U/%F field code -- and put
+# the path to the AppImage itself in front.
+rewrite_exec() {
+  local original="$1" file="$2" extra="$3" want_field_code="${4:-1}" rest
+  rest=$(printf '%s' "$original" | sed 's/^[^[:space:]]*[[:space:]]*//')
+  # Only the main entry gets a field code invented for it. An action that never
+  # asked for one must not start receiving file arguments.
+  if (( want_field_code )) && [[ $rest != *%* ]]; then
+    rest="${rest:+$rest }%U"
+  fi
+  printf '"%s"%s%s' "$file" "${extra:+ $extra}" "${rest:+ $rest}"
+}
+
+# An older layout kept overrides at the top level, keyed by id. Fold those into
+# .apps so a config written before this version keeps working.
+migrate_config() {
+  [[ -s $CONFIG ]] || return 0
+  jq -e 'has("apps") or has("directory")' "$CONFIG" >/dev/null 2>&1 && return 0
+  local tmp
+  tmp=$(mktemp)
+  jq '{apps: .}' "$CONFIG" >"$tmp" && mv "$tmp" "$CONFIG"
+}
+
+appimage_dir() {
+  local dir=""
+  [[ -s $CONFIG ]] && dir=$(jq -r '.directory // ""' "$CONFIG" 2>/dev/null)
+  [[ -n $dir ]] || dir="${APPIMAGE_DIR:-$HOME/AppImage}"
+  printf '%s' "${dir/#\~/$HOME}"
+}
+
+override() {
+  [[ -f $CONFIG ]] || return 0
+  jq -r --arg id "$1" --arg key "$2" '(.apps[$id][$key] // "") | tostring' "$CONFIG" 2>/dev/null | grep -v '^null$' || true
+}
+
+config_set() {
+  local id="$1" key="$2" value="$3" tmp
+  mkdir -p "$(dirname "$CONFIG")"
+  [[ -s $CONFIG ]] || echo '{}' >"$CONFIG"
+  migrate_config
+  tmp=$(mktemp)
+  if [[ -n $value ]]; then
+    jq --arg id "$id" --arg key "$key" --arg value "$value" '.apps[$id][$key] = $value' "$CONFIG" >"$tmp"
+  else
+    jq --arg id "$id" --arg key "$key" '
+      del(.apps[$id][$key])
+      | if (.apps[$id] | length) == 0 then del(.apps[$id]) else . end
+    ' "$CONFIG" >"$tmp"
+  fi
+  mv "$tmp" "$CONFIG"
+}
+
+appimage_files() {
+  find "$(appimage_dir)" -maxdepth 1 -type f -iname '*.appimage' -print0 2>/dev/null | sort -z
+}
+
+# Pull the embedded desktop entry and icon out of an AppImage into its state
+# directory. Only the matching paths are unpacked, so this stays fast even on a
+# 200MB image, and it is skipped entirely while size+mtime are unchanged.
+harvest() {
+  local file="$1" id="$2" state="$STATE_DIR/$id" fingerprint tmp src icon_name target found
+
+  fingerprint=$(stat -c '%s %Y' "$file")
+  [[ $(cat "$state/fingerprint" 2>/dev/null) == "$fingerprint" ]] && return 0
+
+  rm -rf "$state"
+  mkdir -p "$state"
+  tmp=$(mktemp -d)
+
+  (cd "$tmp" && "$file" --appimage-extract '*.desktop' >/dev/null 2>&1) || true
+  src=$(find "$tmp/squashfs-root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -1)
+  [[ -n $src ]] && cp "$src" "$state/entry.desktop"
+
+  # .DirIcon is the AppImage's own icon; usually a symlink into usr/share/icons.
+  (cd "$tmp" && "$file" --appimage-extract '.DirIcon' >/dev/null 2>&1) || true
+  found="$tmp/squashfs-root/.DirIcon"
+  if [[ -L $found ]]; then
+    target=$(readlink "$found")
+    (cd "$tmp" && "$file" --appimage-extract "$target" >/dev/null 2>&1) || true
+    found="$tmp/squashfs-root/$target"
+  fi
+  if [[ ! -f $found ]]; then
+    icon_name=$(entry_get "$state/entry.desktop" Icon)
+    found=""
+    for ext in png svg xpm; do
+      [[ -n $icon_name ]] || break
+      (cd "$tmp" && "$file" --appimage-extract "$icon_name.$ext" >/dev/null 2>&1) || true
+      [[ -f "$tmp/squashfs-root/$icon_name.$ext" ]] && { found="$tmp/squashfs-root/$icon_name.$ext"; break; }
+    done
+  fi
+  [[ -n $found && -f $found ]] && cp "$found" "$state/icon.${found##*.}"
+
+  rm -rf "$tmp"
+  echo "$fingerprint" >"$state/fingerprint"
+}
+
+# Prints nothing and still succeeds when an AppImage carries no icon; a
+# non-zero return here would take every caller down with it under set -e.
+icon_path() {
+  local candidate
+  for candidate in "$STATE_DIR/$1"/icon.*; do
+    [[ -f $candidate ]] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 0
+}
+
+embedded_name() {
+  local name
+  name=$(entry_get "$STATE_DIR/$1/entry.desktop" Name)
+  [[ -n $name ]] || name=$(titleize "$(basename "$2" | sed 's/\.[Aa]pp[Ii]mage$//')")
+  printf '%s' "$name"
+}
+
+display_name() {
+  local name
+  name=$(override "$1" name)
+  [[ -n $name ]] || name=$(embedded_name "$1" "$2")
+  printf '%s' "$name"
+}
+
+write_desktop() {
+  local file="$1" id="$2" state="$STATE_DIR/$id" src="$STATE_DIR/$id/entry.desktop"
+  local out="$DESKTOP_DIR/$PREFIX$id.desktop"
+  local name generic comment categories mime wmclass icon args actions exec_line
+  local action block action_name action_icon action_exec
+
+  name=$(display_name "$id" "$file")
+  generic=$(entry_get "$src" GenericName)
+  comment=$(entry_get "$src" Comment)
+  categories=$(override "$id" categories)
+  [[ -n $categories ]] || categories=$(entry_get "$src" Categories)
+  [[ -n $categories ]] || categories="Utility;"
+  mime=$(entry_get "$src" MimeType)
+  wmclass=$(entry_get "$src" StartupWMClass)
+  args=$(override "$id" args)
+  actions=$(entry_get "$src" Actions)
+  icon=$(icon_path "$id")
+  [[ -n $icon ]] || icon="application-x-executable"
+  exec_line=$(rewrite_exec "$(entry_get "$src" Exec)" "$file" "$args")
+
+  {
+    echo "[Desktop Entry]"
+    echo "Version=1.0"
+    echo "Type=Application"
+    echo "Name=$name"
+    [[ -n $generic ]] && echo "GenericName=$generic"
+    [[ -n $comment ]] && echo "Comment=$comment"
+    # Keywords, GenericName and Comment are all searched by the Omarchy
+    # launcher, so their translations come along too. Name deliberately does
+    # not: a rename would otherwise still show the old name under a locale.
+    entry_get_localized "$src" GenericName
+    entry_get_localized "$src" Comment
+    entry_get_localized "$src" Keywords
+    [[ -n $(entry_get "$src" Keywords) ]] && echo "Keywords=$(entry_get "$src" Keywords)"
+    echo "Exec=$exec_line"
+    echo "TryExec=$file"
+    echo "Icon=$icon"
+    echo "Terminal=false"
+    echo "StartupNotify=true"
+    [[ -n $wmclass ]] && echo "StartupWMClass=$wmclass"
+    echo "Categories=$categories"
+    [[ -n $mime ]] && echo "MimeType=$mime"
+    [[ $(override "$id" hidden) == true ]] && echo "NoDisplay=true"
+    [[ -n $actions ]] && echo "Actions=$actions"
+    echo "X-AppImage-File=$file"
+    [[ -n $(entry_get "$src" X-AppImage-Version) ]] && echo "X-AppImage-Version=$(entry_get "$src" X-AppImage-Version)"
+
+    # Right-click entries on the launcher item ("New Window", "New Private
+    # Window"). Each carries its own Exec, which needs the same rewrite.
+    while IFS= read -r action; do
+      [[ -n $action ]] || continue
+      block=$(entry_action_block "$src" "$action")
+      [[ -n $block ]] || continue
+      action_name=$(printf '%s\n' "$block" | sed -n 's/^Name=//p' | head -1)
+      action_icon=$(printf '%s\n' "$block" | sed -n 's/^Icon=//p' | head -1)
+      action_exec=$(printf '%s\n' "$block" | sed -n 's/^Exec=//p' | head -1)
+      [[ -n $action_name && -n $action_exec ]] || continue
+      echo
+      echo "[Desktop Action $action]"
+      echo "Name=$action_name"
+      printf '%s\n' "$block" | grep -E '^Name\[[^]]+\]=' || true
+      [[ -n $action_icon ]] && echo "Icon=$icon"
+      echo "Exec=$(rewrite_exec "$action_exec" "$file" "$args" 0)"
+    done < <(printf '%s' "$actions" | tr ';' '\n')
+  } >"$out"
+}
+
+# Drop every entry this sync did not just write, and the cache behind it.
+# Keying on "was it written" rather than "does the file still exist" is what
+# makes a renamed AppImage, or an id that changed shape between versions, leave
+# one entry behind instead of two pointing at the same file.
+prune() {
+  local written="$1" entry id
+  for entry in "$DESKTOP_DIR/$PREFIX"*.desktop; do
+    [[ -e $entry ]] || continue
+    id=$(basename "$entry" .desktop | sed "s/^$PREFIX//")
+    [[ $'\n'$written$'\n' == *$'\n'$id$'\n'* ]] && continue
+    rm -f "$entry"
+    rm -rf "${STATE_DIR:?}/$id"
+  done
+}
+
+# Two filenames can still meet on one id once unusual characters fold to a
+# dash ("a b.AppImage" and "a-b.AppImage"). Whoever sorts first keeps the plain
+# id; the rest are numbered, so the pair is at least never one entry.
+unique_id() {
+  local base="$1" taken="$2"
+  local candidate="$base" n=1
+  while [[ $'\n'$taken$'\n' == *$'\n'$candidate$'\n'* ]]; do
+    n=$((n + 1))
+    candidate="$base-$n"
+  done
+  printf '%s' "$candidate"
+}
+
+file_for_id() {
+  local file id seen=""
+  while IFS= read -r -d '' file; do
+    id=$(unique_id "$(id_for "$file")" "$seen")
+    seen+=$'\n'"$id"
+    [[ $id == "$1" ]] && { printf '%s' "$file"; return 0; }
+  done < <(appimage_files)
+  return 1
+}
+
+cmd_sync() {
+  local quiet=0 count=0 file id seen=""
+  [[ ${1:-} == --quiet ]] && quiet=1
+  mkdir -p "$DESKTOP_DIR" "$STATE_DIR" "$(appimage_dir)"
+
+  while IFS= read -r -d '' file; do
+    [[ -x $file ]] || chmod +x "$file"
+    id=$(unique_id "$(id_for "$file")" "$seen")
+    [[ -n $id ]] || continue
+    # Recorded before the write, so one AppImage that fails to unpack cannot
+    # make prune throw away the entry it already had.
+    seen+=$'\n'"$id"
+    if harvest "$file" "$id" && write_desktop "$file" "$id"; then
+      ((count++)) || true
+    else
+      echo "appimages: skipped $file" >&2
+    fi
+  done < <(appimage_files)
+
+  prune "$seen"
+  command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  (( quiet )) || notify "AppImages synced" "$count in $(basename "$(appimage_dir)")"
+}
+
+# TSV for the panel: id, name, file, icon, size, whether the name is a user
+# override, embedded version, window class, hidden, and whether a window of it
+# is open. Tabs cannot appear in any field, so no quoting is needed.
+cmd_list() {
+  local file id name icon custom version wmclass hidden running classes seen=""
+
+  # One hyprctl call for the whole list rather than one per row.
+  classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class // empty' | tr '[:upper:]' '[:lower:]' || true)
+
+  while IFS= read -r -d '' file; do
+    id=$(unique_id "$(id_for "$file")" "$seen")
+    [[ -n $id ]] || continue
+    seen+=$'\n'"$id"
+    name=$(display_name "$id" "$file")
+    icon=$(icon_path "$id")
+    version=$(entry_get "$STATE_DIR/$id/entry.desktop" X-AppImage-Version)
+    wmclass=$(entry_get "$STATE_DIR/$id/entry.desktop" StartupWMClass)
+    custom=0
+    [[ -n $(override "$id" name) ]] && custom=1
+    hidden=0
+    [[ $(override "$id" hidden) == true ]] && hidden=1
+    # Only an AppImage that declares a window class can be matched to a window;
+    # guessing from the name would light up the wrong row.
+    running=0
+    if [[ -n $wmclass ]] && grep -qxF "$(printf '%s' "$wmclass" | tr '[:upper:]' '[:lower:]')" <<<"$classes"; then
+      running=1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$id" "$name" "$file" "$icon" "$(stat -c '%s' "$file")" "$custom" \
+      "$version" "$wmclass" "$hidden" "$running"
+  done < <(appimage_files)
+}
+
+cmd_rename() {
+  local id="${1:-}" name="${2-}" options=() selection base current="" file=""
+  declare -A by_base file_by_id
+
+  while IFS=$'\t' read -r row_id row_name row_file _; do
+    base=$(basename "$row_file")
+    by_base["$base"]="$row_id"
+    file_by_id["$row_id"]="$row_file"
+    [[ $id == "$row_id" ]] && { current="$row_name"; file="$row_file"; }
+    options+=("$GLYPH"$'\t'"$row_name"$'\t'"$base")
+  done < <(cmd_list)
+
+  if (( ${#options[@]} == 0 )); then
+    notify "No AppImages found" "$(appimage_dir) is empty"
+    exit 0
+  fi
+
+  if [[ -z $id ]]; then
+    selection=$(omarchy-menu-select "Rename AppImage" "${options[@]}") || exit 0
+    current=${selection%%$'\t'*}
+    base=${selection##*$'\t'}
+    id="${by_base[$base]:-}"
+    file="${file_by_id[$id]:-}"
+  fi
+  [[ -n $id ]] || exit 0
+
+  # Two arguments means the panel already collected the name; one means we
+  # still have to ask for it.
+  if (( $# < 2 )); then
+    name=$(omarchy-menu-input "Launcher name (empty resets to \"$(embedded_name "$id" "$file")\")") || exit 0
+  fi
+
+  config_set "$id" name "$name"
+  cmd_sync --quiet
+  notify "Renamed" "$(display_name "$id" "$file")"
+}
+
+# Hidden keeps the AppImage and its cached icon, and only writes NoDisplay so
+# the launcher stops offering it. With no second argument it toggles.
+cmd_hide() {
+  local id="${1:-}" want="${2-}"
+  [[ -n $id ]] || { echo "appimages: hide needs an id" >&2; exit 1; }
+  if [[ -z $want ]]; then
+    if [[ $(override "$id" hidden) == true ]]; then want="off"; else want="on"; fi
+  fi
+  case "$want" in
+    on|true|1|yes) config_set "$id" hidden "true" ;;
+    *) config_set "$id" hidden "" ;;
+  esac
+  cmd_sync --quiet
+}
+
+# Deletes the AppImage itself. The launcher entry and the cached icon follow
+# from the sync, the same way they would if the file were removed by hand.
+cmd_delete() {
+  local id="${1:-}" file
+  file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
+  rm -f -- "$file"
+  cmd_sync --quiet
+  notify "Deleted" "$(basename "$file")"
+}
+
+# setsid detaches the app from this script and from whatever called it, so it
+# survives an omarchy-shell restart. A non-zero exit within a few seconds is a
+# failure to start -- a missing FUSE, a broken image -- which would otherwise
+# vanish without a word; a non-zero exit later is just how the user quit.
+cmd_run() {
+  local id="${1:-}" file name log
+  file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
+  name=$(display_name "$id" "$file")
+  log=$(mktemp)
+  setsid -f bash -c '
+    file="$1"; log="$2"; name="$3"; glyph="$4"
+    start=$(date +%s)
+    "$file" >"$log" 2>&1
+    code=$?
+    if (( code != 0 && $(date +%s) - start < 5 )); then
+      omarchy-notification-send -u critical -g "$glyph" "$name did not start" "$(tail -n 1 "$log")"
+    fi
+    rm -f "$log"
+  ' _ "$file" "$log" "$name" "$GLYPH" >/dev/null 2>&1
+}
+
+cmd_focus() {
+  local id="${1:-}" file wmclass
+  file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
+  wmclass=$(entry_get "$STATE_DIR/$id/entry.desktop" StartupWMClass)
+  [[ -n $wmclass ]] || wmclass=$(display_name "$id" "$file")
+  omarchy-hyprland-focus-app "$wmclass"
+}
+
+cmd_menu() {
+  local choice
+  choice=$(omarchy-menu-select "AppImages" \
+    $'󰑐\t'"Sync now" \
+    $'󰑕\t'"Rename" \
+    $'󰉋\t'"Open folder") || exit 0
+  case "$choice" in
+    "Sync now") cmd_sync ;;
+    "Rename") cmd_rename ;;
+    "Open folder") uwsm-app -- xdg-open "$(appimage_dir)" >/dev/null 2>&1 & ;;
+  esac
+}
+
+# Every entry point reads overrides, so fold an older config into the current
+# shape once, up front, rather than in whichever command happens to write next.
+migrate_config
+
+case "${1:-sync}" in
+  sync) shift || true; cmd_sync "$@" ;;
+  list) cmd_list ;;
+  dir) appimage_dir; echo ;;
+  rename) shift; cmd_rename "$@" ;;
+  hide) shift; cmd_hide "$@" ;;
+  delete) shift; cmd_delete "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  focus) shift; cmd_focus "$@" ;;
+  menu) cmd_menu ;;
+  *)
+    echo "Usage: appimages [sync [--quiet] | list | dir | rename [id] [name]" >&2
+    echo "                 | hide <id> [on|off] | run <id> | focus <id> | delete <id> | menu]" >&2
+    exit 1
+    ;;
+esac

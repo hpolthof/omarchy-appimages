@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hpolthof.appimages",
+  "name": "AppImages",
+  "version": "1.0.0",
+  "author": "Paul Olthof",
+  "license": "MIT",
+  "description": "Drop an AppImage in a folder and it shows up in your launcher, with the name, icon, categories and window class it ships with. Rename any of them from the bar; the rename survives the next version of the AppImage. Removing the file removes the launcher entry again.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AppImages",
+    "description": "Lists the AppImages in your folder, with inline rename and a manual sync.",
+    "category": "System",
+    "aliases": [
+      "appimage",
+      "appimages"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
