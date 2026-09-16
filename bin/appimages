@@ -14,8 +14,10 @@
 #   appimages menu                Interactive front-end for the above
 #
 # Names, icons, categories and mime types come from the desktop entry embedded
-# in the AppImage itself. Overrides live in appimages.json and survive both a
-# re-sync and a new version of the AppImage.
+# in the AppImage itself -- read out of the image with a parser, never by
+# running the AppImage. Nothing from an image executes until the user launches
+# it. Overrides live in appimages.json and survive both a re-sync and a new
+# version of the AppImage.
 
 set -euo pipefail
 
@@ -24,6 +26,12 @@ DESKTOP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/state/appimages"
 PREFIX="appimage-"
 GLYPH="󰏖"
+
+# Bounds on what is read out of an image. An image is untrusted input: its
+# desktop entry and icon are parsed under these caps and inside a sandbox.
+MAX_ENTRY_BYTES=65536
+MAX_ICON_BYTES=4194304
+EXTRACT_SECONDS=30
 
 notify() { command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g "$GLYPH" "$1" "${2:-}" || true; }
 
@@ -46,28 +54,98 @@ entry_get() { [[ -f $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }
 
 # Every localized variant of a key, as whole "Key[nl]=value" lines. The
 # launcher searches GenericName, Comment and Keywords, so dropping their
-# translations would make an app findable in English only.
+# translations would make an app findable in English only. Reads the accepted
+# copy of the entry, so what comes back is already single-line and capped.
 entry_get_localized() { [[ -f $1 ]] || return 0; grep -E "^$2\[[^]]+\]=" "$1" || true; }
 
-# The body of one [Desktop Action x] group, without its header.
-entry_action_block() {
-  [[ -f $1 ]] || return 0
-  awk -v group="[Desktop Action $2]" '$0 == group { inside = 1; next } /^\[/ { inside = 0 } inside' "$1"
+# The byte offset of the squashfs image inside a type-2 AppImage: an ELF
+# runtime with the image appended after its section header table, or after
+# its last segment when the table is missing. Sixty-four bytes of arithmetic;
+# nothing from the file runs.
+squashfs_offset() {
+  python3 - "$1" <<'PYEOF'
+import struct, sys
+try:
+    with open(sys.argv[1], "rb") as fh:
+        e = fh.read(64)
+    if len(e) < 64 or e[:4] != b"\x7fELF":
+        sys.exit(1)
+    end = "<" if e[5] == 1 else ">"
+    if e[4] == 2:
+        phoff, shoff = struct.unpack_from(end + "QQ", e, 0x20)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHH", e, 0x36)
+    else:
+        phoff, shoff = struct.unpack_from(end + "II", e, 0x1C)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHH", e, 0x2A)
+    candidates = [shoff + shentsize * shnum if shnum else 0]
+    with open(sys.argv[1], "rb") as fh:
+        fh.seek(phoff)
+        table = fh.read(phentsize * phnum)
+        for i in range(phnum):
+            ph = table[i * phentsize:(i + 1) * phentsize]
+            if len(ph) < phentsize:
+                break
+            if e[4] == 2:
+                p_offset, _, _, p_filesz = struct.unpack_from(end + "QQQQ", ph, 0x08)
+            else:
+                p_offset, _, _, p_filesz = struct.unpack_from(end + "IIII", ph, 0x04)
+            candidates.append(p_offset + p_filesz)
+        off = max(candidates)
+        fh.seek(off)
+        if fh.read(4) != b"hsqs":
+            sys.exit(1)
+    print(off)
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
-# An AppImage's own Exec calls AppRun, or a binary inside the image; neither
-# exists once the entry lives outside it. Keep everything the AppImage put
-# after that first token -- flags it needs, and the %U/%F field code -- and put
-# the path to the AppImage itself in front.
-rewrite_exec() {
-  local original="$1" file="$2" extra="$3" want_field_code="${4:-1}" rest
-  rest=$(printf '%s' "$original" | sed 's/^[^[:space:]]*[[:space:]]*//')
-  # Only the main entry gets a field code invented for it. An action that never
-  # asked for one must not start receiving file arguments.
-  if (( want_field_code )) && [[ $rest != *%* ]]; then
-    rest="${rest:+$rest }%U"
-  fi
-  printf '"%s"%s%s' "$file" "${extra:+ $extra}" "${rest:+ $rest}"
+# unsquashfs on the image, inside bubblewrap: no network, no home directory,
+# the image read-only at /image, one scratch directory writable at /out, a
+# fresh /tmp, and a clock and an address-space cap around the whole thing. A
+# hostile image can make the parser fail or time out; it cannot run anything.
+sandboxed_unsquashfs() {
+  local file="$1" offset="$2" out="$3"
+  shift 3
+  timeout "$EXTRACT_SECONDS" prlimit --as=2147483648 --fsize="$MAX_ICON_BYTES" \
+    bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 \
+      --symlink usr/bin /bin --symlink usr/bin /sbin \
+      --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+      --proc /proc --dev /dev --tmpfs /tmp \
+      --ro-bind "$file" /image --bind "$out" /out \
+      --unshare-all --die-with-parent --new-session --clearenv --chdir /tmp \
+      -- unsquashfs -o "$offset" -d /out/x -no-xattrs -no-progress -quiet -p 1 \
+           -ignore-errors -f /image "$@" >/dev/null 2>&1
+}
+
+# Copies what we use from an untrusted desktop file and nothing else: the
+# [Desktop Entry] group only, a known set of keys, one line each, control
+# characters removed, each value capped. Exec never survives this -- the
+# launcher entry gets an Exec we write ourselves -- and neither do actions,
+# so nothing an image says can end up being run on its behalf.
+accept_entry() {
+  awk '
+    BEGIN {
+      cap["Name"] = 128; cap["GenericName"] = 128; cap["Comment"] = 256
+      cap["Keywords"] = 512; cap["Categories"] = 256; cap["MimeType"] = 512
+      cap["StartupWMClass"] = 128; cap["Icon"] = 64; cap["X-AppImage-Version"] = 32
+      print "[Desktop Entry]"
+    }
+    NR > 400 { exit }
+    /^\[/ { inside = ($0 == "[Desktop Entry]"); next }
+    !inside { next }
+    match($0, /^([A-Za-z-]+)(\[[A-Za-z0-9_@.-]{1,24}\])?=/) {
+      key = $0; sub(/[\[=].*$/, "", key)
+      if (!(key in cap)) next
+      locale = substr($0, length(key) + 1, RLENGTH - length(key) - 1)
+      value = substr($0, RLENGTH + 1)
+      gsub(/[\001-\037\177]/, "", value)
+      if (key == "Icon") { if (locale != "" || value !~ /^[A-Za-z0-9._-]+$/) next }
+      value = substr(value, 1, cap[key])
+      if (value == "") next
+      print key locale "=" value
+    }
+  ' "$1"
 }
 
 # An older layout kept overrides at the top level, keyed by id. Fold those into
@@ -113,44 +191,80 @@ appimage_files() {
   find "$(appimage_dir)" -maxdepth 1 -type f -iname '*.appimage' -print0 2>/dev/null | sort -z
 }
 
-# Pull the embedded desktop entry and icon out of an AppImage into its state
-# directory. Only the matching paths are unpacked, so this stays fast even on a
-# 200MB image, and it is skipped entirely while size+mtime are unchanged.
+# Read the desktop entry and icon out of an AppImage into its state directory
+# without executing it. The fingerprint is recorded whatever happens, so an
+# image that cannot be read is looked at once, not on every sync.
 harvest() {
-  local file="$1" id="$2" state="$STATE_DIR/$id" fingerprint tmp src icon_name target found
+  local file="$1" id="$2" state="$STATE_DIR/$id" fingerprint offset out src icon target
 
   fingerprint=$(stat -c '%s %Y' "$file")
   [[ $(cat "$state/fingerprint" 2>/dev/null) == "$fingerprint" ]] && return 0
 
   rm -rf "$state"
   mkdir -p "$state"
-  tmp=$(mktemp -d)
-
-  (cd "$tmp" && "$file" --appimage-extract '*.desktop' >/dev/null 2>&1) || true
-  src=$(find "$tmp/squashfs-root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -1)
-  [[ -n $src ]] && cp "$src" "$state/entry.desktop"
-
-  # .DirIcon is the AppImage's own icon; usually a symlink into usr/share/icons.
-  (cd "$tmp" && "$file" --appimage-extract '.DirIcon' >/dev/null 2>&1) || true
-  found="$tmp/squashfs-root/.DirIcon"
-  if [[ -L $found ]]; then
-    target=$(readlink "$found")
-    (cd "$tmp" && "$file" --appimage-extract "$target" >/dev/null 2>&1) || true
-    found="$tmp/squashfs-root/$target"
-  fi
-  if [[ ! -f $found ]]; then
-    icon_name=$(entry_get "$state/entry.desktop" Icon)
-    found=""
-    for ext in png svg xpm; do
-      [[ -n $icon_name ]] || break
-      (cd "$tmp" && "$file" --appimage-extract "$icon_name.$ext" >/dev/null 2>&1) || true
-      [[ -f "$tmp/squashfs-root/$icon_name.$ext" ]] && { found="$tmp/squashfs-root/$icon_name.$ext"; break; }
-    done
-  fi
-  [[ -n $found && -f $found ]] && cp "$found" "$state/icon.${found##*.}"
-
-  rm -rf "$tmp"
   echo "$fingerprint" >"$state/fingerprint"
+
+  if ! command -v unsquashfs >/dev/null || ! command -v bwrap >/dev/null; then
+    echo "no-tools" >"$state/status"
+    return 0
+  fi
+  if ! offset=$(squashfs_offset "$file"); then
+    echo "no-image" >"$state/status"
+    return 0
+  fi
+
+  out=$(mktemp -d)
+  sandboxed_unsquashfs "$file" "$offset" "$out" '*.desktop' '.DirIcon' || true
+
+  src=$(find "$out/x" -maxdepth 1 -name '*.desktop' -type f 2>/dev/null | head -1)
+  if [[ -n $src ]] && (( $(stat -c '%s' "$src") <= MAX_ENTRY_BYTES )); then
+    accept_entry "$src" >"$state/entry.desktop"
+  fi
+
+  # .DirIcon is the AppImage's own icon, usually a symlink into the image. The
+  # link comes out of the first pass; its target is fetched by exact name in a
+  # second, so a link can only ever point at something inside the image.
+  icon="$out/x/.DirIcon"
+  if [[ -L $icon ]]; then
+    target=$(readlink "$icon")
+    target=${target#/}
+    icon=""
+    if [[ $target != *..* && $target == [A-Za-z0-9._]* ]]; then
+      sandboxed_unsquashfs "$file" "$offset" "$out" "$target" || true
+      icon="$out/x/$target"
+    fi
+  fi
+  if [[ ! -f $icon ]]; then
+    # Second chance: the icon named by the entry, at the image root as the
+    # AppImage spec requires. The name was validated to a plain filename.
+    target=$(entry_get "$state/entry.desktop" Icon)
+    icon=""
+    if [[ -n $target ]]; then
+      sandboxed_unsquashfs "$file" "$offset" "$out" "$target.png" "$target.svg" "$target.xpm" || true
+      for ext in png svg xpm; do
+        [[ -f "$out/x/$target.$ext" ]] && { icon="$out/x/$target.$ext"; break; }
+      done
+    fi
+  fi
+  [[ -n $icon && -f $icon ]] && accept_icon "$icon" "$state"
+
+  rm -rf "$out"
+  echo "ok" >"$state/status"
+}
+
+# An icon is kept only when it is small enough and starts like a PNG, SVG or
+# XPM; anything else is left behind and the entry gets the generic icon.
+accept_icon() {
+  local src="$1" state="$2" magic head ext
+  (( $(stat -c '%s' "$src") <= MAX_ICON_BYTES )) || return 0
+  magic=$(head -c 8 "$src" | od -An -tx1 | tr -d ' \n')
+  head=$(head -c 256 "$src" | tr -d '\000' | tr -cd '[:print:]')
+  if [[ $magic == 89504e470d0a1a0a ]]; then ext=png
+  elif [[ $head == *"<svg"* || $head == *"<?xml"* ]]; then ext=svg
+  elif [[ $head == *"XPM"* ]]; then ext=xpm
+  else return 0
+  fi
+  cp "$src" "$state/icon.$ext"
 }
 
 # Prints nothing and still succeeds when an AppImage carries no icon; a
@@ -178,24 +292,24 @@ display_name() {
 }
 
 write_desktop() {
-  local file="$1" id="$2" state="$STATE_DIR/$id" src="$STATE_DIR/$id/entry.desktop"
+  local file="$1" id="$2" src="$STATE_DIR/$id/entry.desktop"
   local out="$DESKTOP_DIR/$PREFIX$id.desktop"
-  local name generic comment categories mime wmclass icon args actions exec_line
-  local action block action_name action_icon action_exec
+  local name generic comment categories mime wmclass icon args keywords version
 
   name=$(display_name "$id" "$file")
   generic=$(entry_get "$src" GenericName)
   comment=$(entry_get "$src" Comment)
-  categories=$(override "$id" categories)
+  keywords=$(entry_get "$src" Keywords)
+  categories=$(clean_line "$(override "$id" categories)" 256)
   [[ -n $categories ]] || categories=$(entry_get "$src" Categories)
   [[ -n $categories ]] || categories="Utility;"
   mime=$(entry_get "$src" MimeType)
   wmclass=$(entry_get "$src" StartupWMClass)
-  args=$(override "$id" args)
-  actions=$(entry_get "$src" Actions)
+  version=$(entry_get "$src" X-AppImage-Version)
+  # The only arguments that reach Exec are the user's own, from the config.
+  args=$(clean_line "$(override "$id" args)" 256)
   icon=$(icon_path "$id")
   [[ -n $icon ]] || icon="application-x-executable"
-  exec_line=$(rewrite_exec "$(entry_get "$src" Exec)" "$file" "$args")
 
   {
     echo "[Desktop Entry]"
@@ -210,8 +324,8 @@ write_desktop() {
     entry_get_localized "$src" GenericName
     entry_get_localized "$src" Comment
     entry_get_localized "$src" Keywords
-    [[ -n $(entry_get "$src" Keywords) ]] && echo "Keywords=$(entry_get "$src" Keywords)"
-    echo "Exec=$exec_line"
+    [[ -n $keywords ]] && echo "Keywords=$keywords"
+    echo "Exec=\"$file\"${args:+ $args} %U"
     echo "TryExec=$file"
     echo "Icon=$icon"
     echo "Terminal=false"
@@ -220,28 +334,17 @@ write_desktop() {
     echo "Categories=$categories"
     [[ -n $mime ]] && echo "MimeType=$mime"
     [[ $(override "$id" hidden) == true ]] && echo "NoDisplay=true"
-    [[ -n $actions ]] && echo "Actions=$actions"
     echo "X-AppImage-File=$file"
-    [[ -n $(entry_get "$src" X-AppImage-Version) ]] && echo "X-AppImage-Version=$(entry_get "$src" X-AppImage-Version)"
-
-    # Right-click entries on the launcher item ("New Window", "New Private
-    # Window"). Each carries its own Exec, which needs the same rewrite.
-    while IFS= read -r action; do
-      [[ -n $action ]] || continue
-      block=$(entry_action_block "$src" "$action")
-      [[ -n $block ]] || continue
-      action_name=$(printf '%s\n' "$block" | sed -n 's/^Name=//p' | head -1)
-      action_icon=$(printf '%s\n' "$block" | sed -n 's/^Icon=//p' | head -1)
-      action_exec=$(printf '%s\n' "$block" | sed -n 's/^Exec=//p' | head -1)
-      [[ -n $action_name && -n $action_exec ]] || continue
-      echo
-      echo "[Desktop Action $action]"
-      echo "Name=$action_name"
-      printf '%s\n' "$block" | grep -E '^Name\[[^]]+\]=' || true
-      [[ -n $action_icon ]] && echo "Icon=$icon"
-      echo "Exec=$(rewrite_exec "$action_exec" "$file" "$args" 0)"
-    done < <(printf '%s' "$actions" | tr ';' '\n')
+    [[ -n $version ]] && echo "X-AppImage-Version=$version"
+    # The block's status is the function's; an optional last line must not
+    # turn a fully written entry into a "skipped" one.
+    :
   } >"$out"
+}
+
+# One line, no control characters, at most $2 characters.
+clean_line() {
+  printf '%s' "$1" | head -1 | tr -d '\000-\037\177' | cut -c1-"$2"
 }
 
 # Drop every entry this sync did not just write, and the cache behind it.

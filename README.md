@@ -16,13 +16,20 @@ AppImage.
 - **Watches the folder.** A headless service runs `inotifywait` on the
   AppImage folder, so entries appear and disappear as files do — no polling,
   no login script.
-- **Reads the AppImage, not the filename.** Every AppImage carries its own
-  desktop entry and icon. The plugin unpacks just those two paths — a couple
-  of hundred milliseconds even on a 200MB image — and builds the launcher
-  entry from them. Everything the launcher searches on comes along —
+- **Reads the AppImage, never runs it.** Every AppImage carries its own
+  desktop entry and icon in the squashfs image appended to its runtime. The
+  plugin finds that image from the ELF header and reads just those two files
+  out of it with `unsquashfs`, inside a `bubblewrap` sandbox with no network,
+  no home directory and a time and memory cap — a couple of hundred
+  milliseconds even on a 200MB image. Nothing in an AppImage executes until
+  you launch it. Everything the launcher searches on comes along —
   `GenericName`, `Keywords` and their translations — along with
-  `StartupWMClass`, so Hyprland matches the window to the app, the flags the
-  AppImage's own `Exec` carried, and its right-click actions ("New Window").
+  `StartupWMClass`, so Hyprland matches the window to the app.
+- **Trusts nothing it reads.** The entry's fields are taken one line at a
+  time, capped in length, control characters stripped, unknown keys and groups
+  dropped. The launcher entry's `Exec` is written by the plugin, not copied
+  from the image, and an icon is kept only if it is small and actually a PNG,
+  SVG or XPM. A hostile image gets a plain entry named after its file.
 - **Falls back gracefully.** An AppImage with no embedded metadata still gets
   an entry, named after its filename (`sound_studio.AppImage` → "Sound
   Studio") with a generic icon.
@@ -55,10 +62,14 @@ with `omarchy bar move io.github.hpolthof.appimages --section left`.
 
 ### Dependencies
 
-Everything here ships with Omarchy already; nothing extra is installed.
+Everything here ships with Omarchy except `squashfs-tools`, which is in the
+Arch `extra` repository: `omarchy pkg add squashfs-tools`. Without it, or
+without `bubblewrap`, the plugin still works but reads nothing out of an
+image: entries are named after the file and get a generic icon.
 
 | Used for | Needs |
 | --- | --- |
+| Reading the entry and icon out of an image | `unsquashfs` (`squashfs-tools`), `bwrap` (`bubblewrap`), `python3` |
 | Reading and writing the override file | `jq` |
 | Watching the folder | `inotifywait` (`inotify-tools`) |
 | Seeing which AppImages have a window open | `hyprctl` |
@@ -156,7 +167,7 @@ above, and only deletes an AppImage when you ask it to from the panel.
 | --- | --- |
 | `directory` | Folder to watch. Defaults to `~/AppImage`. |
 | `apps.<id>.name` | Launcher name. Absent means the AppImage's own name. |
-| `apps.<id>.args` | Extra arguments appended to `Exec`, e.g. `--no-sandbox`. |
+| `apps.<id>.args` | Extra arguments appended to `Exec`, e.g. `--no-sandbox`. The only arguments that ever reach `Exec` are these; nothing from the image does. |
 | `apps.<id>.categories` | Overrides the AppImage's `Categories`. |
 | `apps.<id>.hidden` | `"true"` writes `NoDisplay=true`, hiding it from the launcher. The panel's eye button writes this. |
 
@@ -213,10 +224,11 @@ To reach it from the Omarchy menu instead, add this to
 | Path | Contents |
 | --- | --- |
 | `~/.local/share/applications/appimage-*.desktop` | The launcher entries. Each carries `X-AppImage-File`, which is how the plugin recognises its own and cleans them up. |
-| `~/.local/state/appimages/<id>/` | Cached icon, embedded desktop entry, and the size+mtime fingerprint that lets a no-op sync stay a no-op. |
+| `~/.local/state/appimages/<id>/` | Cached icon, the accepted copy of the embedded desktop entry, a status (`ok`, `no-image`, `no-tools`), and the size+mtime fingerprint that lets a no-op sync stay a no-op. |
 | `~/.config/omarchy/appimages.json` | Your overrides. |
 
-Nothing else on the system is touched, and no AppImage is ever modified.
+Nothing else on the system is touched, no AppImage is ever modified, and no
+AppImage is ever executed by the plugin on its own — only when you run it.
 
 ## License
 
