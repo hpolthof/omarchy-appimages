@@ -9,6 +9,7 @@ var GLYPH = {
   eye: "󰈈",
   eyeOff: "󰈉",
   trash: "󰆴",
+  shield: "󰕥",
   focus: "󰏌",
   folder: "󰉋"
 }
@@ -22,7 +23,7 @@ function parseList(text) {
     var line = lines[i]
     if (line.trim() === "") continue
     var parts = line.split("\t")
-    if (parts.length < 10) continue
+    if (parts.length < 11) continue
     var file = parts[2]
     rows.push({
       id: parts[0],
@@ -35,7 +36,8 @@ function parseList(text) {
       version: parts[6],
       wmclass: parts[7],
       hidden: parts[8] === "1",
-      running: parts[9] === "1"
+      running: parts[9] === "1",
+      trusted: parts[10] === "1"
     })
   }
   return rows
@@ -67,6 +69,7 @@ function detailLine(row) {
   if (row.version) parts.push("v" + row.version)
   if (row.custom) parts.push("renamed")
   if (row.hidden) parts.push("hidden")
+  if (!row.trusted) parts.push("not allowed to run yet")
   // Running is deliberately absent: the row's first button already says so,
   // in the accent colour and with a focus glyph instead of a play one.
   return parts.join(" · ")

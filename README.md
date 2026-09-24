@@ -3,11 +3,15 @@
 An Omarchy shell plugin that keeps a folder of AppImages and your application
 launcher in step.
 
-Drop an AppImage in `~/AppImage` and it shows up in the launcher a moment
-later, under the name, icon, categories, mime types and window class the
-AppImage ships with. Delete the file and the launcher entry goes with it.
-Anything you rename stays renamed, including across a new version of the
-AppImage.
+Drop an AppImage in `~/AppImage` and it shows up in the bar's panel a moment
+later, under the name and icon it ships with. Allow it to run once — Enter on
+its row, then confirm — and it becomes executable and gets a launcher entry
+with its own categories, mime types and window class. Delete the file and the
+entry goes with it. Anything you rename stays renamed, including across a new
+version of the AppImage.
+
+The plugin never makes a file executable on its own, and never runs one: a
+download that lands in the folder is read, not trusted.
 
 ![AppImages panel](preview.png)
 
@@ -28,11 +32,22 @@ AppImage.
   image. Nothing in an AppImage executes until you launch it. Everything the launcher searches on comes along —
   `GenericName`, `Keywords` and their translations — along with
   `StartupWMClass`, so Hyprland matches the window to the app.
+- **Asks before anything can run.** Sync never sets an execute bit. A file
+  that is not executable is shown in the panel as "not allowed to run yet" and
+  gets no launcher entry until you allow it; allowing sets only the owner's
+  execute bit, through a descriptor opened without following symlinks, on a
+  regular file you own. A file you made executable yourself counts as allowed.
 - **Trusts nothing it reads.** The entry's fields are taken one line at a
   time, capped in length, control characters stripped, unknown keys and groups
   dropped. The launcher entry's `Exec` is written by the plugin, not copied
-  from the image, and an icon is kept only if it is small and actually a PNG,
-  SVG or XPM. A hostile image gets a plain entry named after its file.
+  from the image. The icon handed to the bar and the launcher is always a PNG
+  of at most 1024×1024 rewritten to its critical chunks; an SVG is rasterised
+  to one inside the sandbox first. A hostile image gets a plain entry named
+  after its file.
+- **Refuses names it cannot write safely.** A file is only picked up when its
+  path uses letters, digits, spaces and `._+@,()~-`. Anything else — quotes,
+  `$`, `%`, a newline — would have meaning inside a launcher entry, so the file
+  is skipped with a notification asking you to rename it, rather than escaped.
 - **Falls back gracefully.** An AppImage with no embedded metadata still gets
   an entry, named after its filename (`sound_studio.AppImage` → "Sound
   Studio") with a generic icon.
@@ -65,10 +80,11 @@ with `omarchy bar move io.github.hpolthof.appimages --section left`.
 
 ### Dependencies
 
-Everything here ships with Omarchy except `squashfs-tools`, which is in the
-Arch `extra` repository: `omarchy pkg add squashfs-tools`. Without it, or
-without `bubblewrap`, the plugin still works but reads nothing out of an
-image: entries are named after the file and get a generic icon.
+Everything here ships with Omarchy except the `squashfs-tools` package from
+the Arch `extra` repository. Without it, or without `bubblewrap`, the plugin
+still works but reads nothing out of an image: entries are named after the
+file and get a generic icon. `rsvg-convert` (`librsvg`, part of Omarchy) is
+used to turn an SVG icon into a PNG when present.
 
 | Used for | Needs |
 | --- | --- |
@@ -90,7 +106,9 @@ skipped when it is not.
 Click the 󰏖 icon in the bar for the list. Each row shows the launcher name,
 the filename, the size and the version the AppImage reports, and carries four
 buttons: run it (or focus it, if a window is already open), rename it, hide it
-from the launcher, or delete the file. The row itself does nothing on click, so
+from the launcher, or delete the file. A new AppImage's first button is a
+shield instead: it asks whether to allow the file to run, and only after you
+confirm does it become executable and appear in the launcher. The row itself does nothing on click, so
 there is never a question of what will happen — but hovering it moves the
 cursor there, so the mouse and the keyboard drive the same selection.
 
@@ -108,7 +126,7 @@ of their own:
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Move the cursor, rows then footer |
-| `Enter` | Run the selected AppImage, or press the selected footer button |
+| `Enter` | Run the selected AppImage (or allow it, after a confirmation, if it may not run yet), or press the selected footer button |
 | `r` | Rename the selected AppImage |
 | `h` | Hide it from the launcher, or show it again |
 | `Del` | Delete the file, after a confirmation |
@@ -193,6 +211,7 @@ omarchy-shell io.github.hpolthof.appimages rename orca-linux "Orca IDE"
 omarchy-shell io.github.hpolthof.appimages run orca-linux      # run, or focus
 omarchy-shell io.github.hpolthof.appimages toggleHidden orca-linux
 omarchy-shell io.github.hpolthof.appimages remove orca-linux   # deletes the file
+omarchy-shell io.github.hpolthof.appimages trust orca-linux    # allow it to run
 ```
 
 `bin/appimages` is a normal script and works on its own, including a menu-driven
@@ -203,6 +222,7 @@ bin/appimages sync [--quiet]      # regenerate desktop entries
 bin/appimages list                # one TSV row per AppImage
 bin/appimages rename [id] [name]  # empty name resets to the embedded one
 bin/appimages hide <id> [on|off]  # toggles without a second argument
+bin/appimages trust [id]          # allow an AppImage to run; menu when no id
 bin/appimages run <id>            # detached, and reports a start that fails
 bin/appimages focus <id>          # focus its window, if one is open
 bin/appimages delete <id>         # deletes the AppImage file
@@ -228,10 +248,12 @@ To reach it from the Omarchy menu instead, add this to
 | --- | --- |
 | `~/.local/share/applications/appimage-*.desktop` | The launcher entries. Each carries `X-AppImage-File`, which is how the plugin recognises its own and cleans them up. |
 | `~/.local/state/appimages/<id>/` | Cached icon, the accepted copy of the embedded desktop entry, a status (`ok`, `no-entry`, `no-image`, `no-tools`), and the size+mtime fingerprint that lets a no-op sync stay a no-op. |
+| `~/.local/state/appimages/.rejected/` | One marker per skipped filename, so you are told about each once. |
 | `~/.config/omarchy/appimages.json` | Your overrides. |
 
-Nothing else on the system is touched, no AppImage is ever modified, and no
-AppImage is ever executed by the plugin on its own — only when you run it.
+Nothing else on the system is touched. No AppImage is ever executed by the
+plugin on its own, and the only change it ever makes to one is the owner's
+execute bit, when you allow it to run.
 
 ## License
 

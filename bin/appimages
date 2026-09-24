@@ -8,6 +8,8 @@
 #   appimages dir                 Print the watched directory
 #   appimages rename [id] [name]  Set a launcher name; empty name resets it
 #   appimages hide [id] [on|off]  Keep an AppImage out of the launcher
+#   appimages trust [id]          Allow an AppImage to run: mark it executable
+#                                 and give it a launcher entry
 #   appimages run <id>            Launch it, reporting a start that fails
 #   appimages focus <id>          Focus its window if one is open
 #   appimages delete <id>         Delete the AppImage file itself
@@ -16,8 +18,10 @@
 # Names, icons, categories and mime types come from the desktop entry embedded
 # in the AppImage itself -- read out of the image with a parser, never by
 # running the AppImage. Nothing from an image executes until the user launches
-# it. Overrides live in appimages.json and survive both a re-sync and a new
-# version of the AppImage.
+# it, and a file only gets a launcher entry once it is executable -- which the
+# plugin never makes it on its own, only when the user allows it with `trust`.
+# Overrides live in appimages.json and survive both a re-sync and a new version
+# of the AppImage.
 
 set -euo pipefail
 
@@ -34,8 +38,29 @@ MAX_ICON_BYTES=4194304
 EXTRACT_SECONDS=30
 HEADER_SECONDS=5
 HEADER_MEMORY=$((128 * 1024 * 1024))
+MAX_ICON_PX=1024
 
-notify() { command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g "$GLYPH" "$1" "${2:-}" || true; }
+# What may appear in a path that goes into a launcher entry. Exec quotes the
+# path, and inside those quotes the desktop-entry spec gives ", `, $ and \ a
+# meaning, % starts a field code, and a newline ends the line -- so none of
+# those are allowed, and neither is anything else outside this plain set. A
+# file whose path falls outside it is skipped, with a notification, never
+# escaped: an entry we did not have to escape cannot be escaped wrongly.
+SAFE_PATH_RE='^/[A-Za-z0-9 ._+@,()~/-]{1,1024}$'
+SAFE_ARGS_RE='^[A-Za-z0-9 ._=:/,+@-]{0,256}$'
+SAFE_CATEGORIES_RE='^[A-Za-z0-9;_-]{1,256}$'
+
+notify() {
+  [[ -n ${APPIMAGES_NO_NOTIFY:-} ]] && return 0
+  command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g "$GLYPH" "$1" "${2:-}" || true
+}
+
+# Bracket ranges such as A-Z follow the locale in a bash regex, and in a UTF-8
+# locale they also match letters like é. Every allow-list check therefore runs
+# in the C locale, where A-Z means exactly those 26 bytes.
+ascii_match() { local LC_ALL=C; [[ $1 =~ $2 ]]; }
+
+safe_path() { ascii_match "$1" "$SAFE_PATH_RE" && [[ $1 != *//* ]]; }
 
 titleize() { printf '%s' "$1" | sed 's/[-_.]\+/ /g; s/\b\(.\)/\u\1/g'; }
 
@@ -173,22 +198,38 @@ sandboxed_unsquashfs() {
   shift 3
   while (( $# )) && [[ $1 != -- ]]; do opts+=("$1"); shift; done
   [[ ${1:-} == -- ]] && shift
-  timeout "$EXTRACT_SECONDS" prlimit --as=2147483648 --fsize="$MAX_ICON_BYTES" \
+  sandbox "$EXTRACT_SECONDS" 2147483648 "$file" "$out" -- \
+    unsquashfs -o "$offset" -d /out/x -no-xattrs -no-progress -quiet -p 1 \
+      -ignore-errors -f "${opts[@]}" /image "$@" 2>/dev/null
+}
+
+# Usage: sandbox SECONDS ADDRESS-SPACE RO-FILE OUT-DIR -- COMMAND...
+# Runs COMMAND in bubblewrap with /usr read-only, RO-FILE at /image, OUT-DIR
+# writable at /out, a fresh /tmp, no network or other namespaces shared, a
+# cleared environment, and a clock, an address-space cap and a per-file size
+# cap around it. Everything that parses untrusted image content goes through
+# here.
+sandbox() {
+  local seconds="$1" memory="$2" file="$3" out="$4"
+  shift 4
+  [[ ${1:-} == -- ]] && shift
+  timeout "$seconds" prlimit --as="$memory" --fsize="$MAX_ICON_BYTES" \
     bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 \
       --symlink usr/bin /bin --symlink usr/bin /sbin \
       --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+      --ro-bind-try /etc/fonts /etc/fonts \
       --proc /proc --dev /dev --tmpfs /tmp \
       --ro-bind "$file" /image --bind "$out" /out \
-      --unshare-all --die-with-parent --new-session --clearenv --chdir /tmp \
-      -- unsquashfs -o "$offset" -d /out/x -no-xattrs -no-progress -quiet -p 1 \
-           -ignore-errors -f "${opts[@]}" /image "$@" 2>/dev/null
+      --unshare-all --die-with-parent --new-session --clearenv \
+      --setenv HOME /tmp --chdir /tmp \
+      -- "$@"
 }
 
 # A path inside the image we are willing to ask for by name: relative, plain
 # characters, no ".." component, bounded length.
 image_path_ok() {
   local p="$1"
-  [[ ${#p} -le 255 && $p =~ ^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$ && $p != *..* ]]
+  [[ ${#p} -le 255 && $p != *..* ]] && ascii_match "$p" '^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$'
 }
 
 # Copies what we use from an untrusted desktop file and nothing else: the
@@ -321,8 +362,8 @@ harvest() {
     # AppImage spec requires. The name was validated to a plain filename.
     target=$(entry_get "$state/entry.desktop" Icon)
     if [[ -n $target ]] && image_path_ok "$target"; then
-      sandboxed_unsquashfs "$file" "$offset" "$out" -no-wildcards -- "$target.png" "$target.svg" "$target.xpm" >/dev/null || true
-      for ext in png svg xpm; do
+      sandboxed_unsquashfs "$file" "$offset" "$out" -no-wildcards -- "$target.png" "$target.svg" >/dev/null || true
+      for ext in png svg; do
         [[ -f "$out/x/$target.$ext" && ! -L "$out/x/$target.$ext" ]] && { icon="$out/x/$target.$ext"; break; }
       done
     fi
@@ -333,19 +374,89 @@ harvest() {
   if [[ -s $state/entry.desktop ]]; then echo "ok" >"$state/status"; else echo "no-entry" >"$state/status"; fi
 }
 
-# An icon is kept only when it is small enough and starts like a PNG, SVG or
-# XPM; anything else is left behind and the entry gets the generic icon.
+# The icon is drawn by the bar and by the launcher, outside any sandbox, so
+# only one kind of file is ever handed to them: a PNG of at most
+# MAX_ICON_PX x MAX_ICON_PX, rewritten to its critical chunks. An SVG is first
+# rasterised to a 256 px PNG inside the sandbox; anything else is dropped and
+# the entry gets the generic icon.
 accept_icon() {
-  local src="$1" state="$2" magic head ext
+  local src="$1" state="$2" out
   (( $(stat -c '%s' "$src") <= MAX_ICON_BYTES )) || return 0
-  magic=$(head -c 8 "$src" | od -An -tx1 | tr -d ' \n')
-  head=$(head -c 256 "$src" | tr -d '\000' | tr -cd '[:print:]')
-  if [[ $magic == 89504e470d0a1a0a ]]; then ext=png
-  elif [[ $head == *"<svg"* || $head == *"<?xml"* ]]; then ext=svg
-  elif [[ $head == *"XPM"* ]]; then ext=xpm
-  else return 0
+  if png_clean "$src" "$state/icon.png"; then
+    return 0
   fi
-  cp "$src" "$state/icon.$ext"
+  rm -f "$state/icon.png"
+  if command -v rsvg-convert >/dev/null && head -c 1024 "$src" | grep -qa '<svg'; then
+    out=$(mktemp -d)
+    sandbox 10 $((512 * 1024 * 1024)) "$src" "$out" -- \
+      rsvg-convert -w 256 -h 256 -a -f png -o /out/icon.png /image >/dev/null 2>&1 || true
+    if [[ -f $out/icon.png && ! -L $out/icon.png ]]; then
+      png_clean "$out/icon.png" "$state/icon.png" || rm -f "$state/icon.png"
+    fi
+    rm -rf "$out"
+  fi
+  return 0
+}
+
+# Copies a PNG from $1 to $2 keeping only IHDR, PLTE, tRNS, IDAT and IEND,
+# after checking the signature, that IHDR comes first with sane fields and
+# dimensions of at most MAX_ICON_PX, that every chunk lies inside the file,
+# and that it ends at IEND. Ancillary chunks go: a compressed text or ICC
+# chunk is how a small PNG becomes a large decompression. Checksums are
+# recomputed; nothing is decoded. Exit 0 only when $2 was written.
+png_clean() {
+  timeout "$HEADER_SECONDS" prlimit --as="$HEADER_MEMORY" /usr/bin/python3 -I - "$1" "$2" "$MAX_ICON_PX" "$MAX_ICON_BYTES" <<'PYEOF'
+import os, stat, struct, sys, zlib
+
+src, dst, max_px, max_bytes = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+KEEP = {b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND"}
+try:
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+        sys.exit(1)
+    data = b""
+    while len(data) < st.st_size:
+        chunk = os.read(fd, min(65536, st.st_size - len(data)))
+        if not chunk:
+            break
+        data += chunk
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        sys.exit(1)
+    pos, out, first, chunks = 8, [data[:8]], True, 0
+    while True:
+        chunks += 1
+        if chunks > 10000 or pos + 12 > len(data):
+            sys.exit(1)
+        (length,) = struct.unpack_from(">I", data, pos)
+        ctype = data[pos + 4:pos + 8]
+        if length > len(data) - pos - 12:
+            sys.exit(1)
+        body = data[pos + 8:pos + 8 + length]
+        if first:
+            if ctype != b"IHDR" or length != 13:
+                sys.exit(1)
+            w, h, depth, color, comp, filt, lace = struct.unpack(">IIBBBBB", body)
+            if not (1 <= w <= max_px and 1 <= h <= max_px):
+                sys.exit(1)
+            if depth not in (1, 2, 4, 8, 16) or color not in (0, 2, 3, 4, 6) or comp or filt or lace > 1:
+                sys.exit(1)
+            first = False
+        if ctype in KEEP:
+            out.append(struct.pack(">I", length) + ctype + body
+                       + struct.pack(">I", zlib.crc32(ctype + body) & 0xFFFFFFFF))
+        pos += 12 + length
+        if ctype == b"IEND":
+            break
+    tmp = dst + ".part"
+    with open(tmp, "wb") as fh:
+        fh.write(b"".join(out))
+    os.replace(tmp, dst)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
 # Prints nothing and still succeeds when an AppImage carries no icon; a
@@ -367,7 +478,7 @@ embedded_name() {
 
 display_name() {
   local name
-  name=$(override "$1" name)
+  name=$(clean_line "$(override "$1" name)" 128)
   [[ -n $name ]] || name=$(embedded_name "$1" "$2")
   printf '%s' "$name"
 }
@@ -378,10 +489,15 @@ write_desktop() {
   local name generic comment categories mime wmclass icon args keywords version
 
   name=$(display_name "$id" "$file")
+  # A name typed by the user is plain text; in a desktop file a backslash
+  # starts an escape, so it is doubled. Names from the image keep theirs --
+  # the spec gives them that meaning -- after accept_entry has capped them.
+  [[ -n $(override "$id" name) ]] && name=${name//\\/\\\\}
   generic=$(entry_get "$src" GenericName)
   comment=$(entry_get "$src" Comment)
   keywords=$(entry_get "$src" Keywords)
   categories=$(clean_line "$(override "$id" categories)" 256)
+  ascii_match "$categories" "$SAFE_CATEGORIES_RE" || categories=""
   [[ -n $categories ]] || categories=$(entry_get "$src" Categories)
   [[ -n $categories ]] || categories="Utility;"
   mime=$(entry_get "$src" MimeType)
@@ -389,6 +505,10 @@ write_desktop() {
   version=$(entry_get "$src" X-AppImage-Version)
   # The only arguments that reach Exec are the user's own, from the config.
   args=$(clean_line "$(override "$id" args)" 256)
+  if [[ -n $args ]] && ! ascii_match "$args" "$SAFE_ARGS_RE"; then
+    echo "appimages: ignoring args for $id: only [A-Za-z0-9 ._=:/,+@-] are allowed" >&2
+    args=""
+  fi
   icon=$(icon_path "$id")
   [[ -n $icon ]] || icon="application-x-executable"
 
@@ -428,18 +548,44 @@ clean_line() {
   printf '%s' "$1" | head -1 | tr -d '\000-\037\177' | cut -c1-"$2"
 }
 
-# Drop every entry this sync did not just write, and the cache behind it.
-# Keying on "was it written" rather than "does the file still exist" is what
-# makes a renamed AppImage, or an id that changed shape between versions, leave
-# one entry behind instead of two pointing at the same file.
+# Drop every launcher entry this sync did not just write, and every cache for
+# an AppImage that is no longer there. Keying entries on "was it written"
+# rather than "does the file still exist" is what makes a renamed AppImage, or
+# one that is no longer allowed to run, leave no entry behind. The cache is
+# kept for any file still present, so the panel can show one that is waiting
+# to be allowed without reading it again.
 prune() {
-  local written="$1" entry id
+  local written="$1" present="$2" entry dir id
   for entry in "$DESKTOP_DIR/$PREFIX"*.desktop; do
     [[ -e $entry ]] || continue
     id=$(basename "$entry" .desktop | sed "s/^$PREFIX//")
     [[ $'\n'$written$'\n' == *$'\n'$id$'\n'* ]] && continue
     rm -f "$entry"
+  done
+  for dir in "$STATE_DIR"/*/; do
+    [[ -d $dir ]] || continue
+    id=$(basename "$dir")
+    [[ $'\n'$present$'\n' == *$'\n'$id$'\n'* ]] && continue
     rm -rf "${STATE_DIR:?}/$id"
+  done
+}
+
+# Tell the user once about each file that was skipped for its name, and forget
+# the ones that are gone. The name is shown quoted, so what the notification
+# displays is the name, not whatever its characters would do.
+report_rejected() {
+  local marks="$STATE_DIR/.rejected" file key keep=""
+  mkdir -p "$marks"
+  for file in "$@"; do
+    key=$(printf '%s' "$file" | sha256sum | cut -c1-32)
+    keep+=$'\n'"$key"
+    [[ -e $marks/$key ]] && continue
+    : >"$marks/$key"
+    notify "AppImage skipped" "$(printf '%q' "$(basename -- "$file")" | cut -c1-120) has characters a launcher entry cannot hold safely. Rename the file to use letters, digits, spaces and ._+@,()~- only."
+  done
+  for file in "$marks"/*; do
+    [[ -e $file ]] || continue
+    [[ $'\n'$keep$'\n' == *$'\n'$(basename "$file")$'\n'* ]] || rm -f "$file"
   done
 }
 
@@ -459,6 +605,7 @@ unique_id() {
 file_for_id() {
   local file id seen=""
   while IFS= read -r -d '' file; do
+    safe_path "$file" || continue
     id=$(unique_id "$(id_for "$file")" "$seen")
     seen+=$'\n'"$id"
     [[ $id == "$1" ]] && { printf '%s' "$file"; return 0; }
@@ -467,39 +614,55 @@ file_for_id() {
 }
 
 cmd_sync() {
-  local quiet=0 count=0 file id seen=""
+  local quiet=0 count=0 file id seen="" written="" rejected=()
   [[ ${1:-} == --quiet ]] && quiet=1
   mkdir -p "$DESKTOP_DIR" "$STATE_DIR" "$(appimage_dir)"
 
   while IFS= read -r -d '' file; do
-    [[ -x $file ]] || chmod +x "$file"
+    if ! safe_path "$file"; then
+      rejected+=("$file")
+      continue
+    fi
     id=$(unique_id "$(id_for "$file")" "$seen")
     [[ -n $id ]] || continue
-    # Recorded before the write, so one AppImage that fails to unpack cannot
-    # make prune throw away the entry it already had.
     seen+=$'\n'"$id"
-    if harvest "$file" "$id" && write_desktop "$file" "$id"; then
+    # Reading the image is safe whether or not it may run; it is what lets the
+    # panel show a new AppImage by its own name and icon while it waits.
+    if ! harvest "$file" "$id"; then
+      echo "appimages: skipped $file" >&2
+      continue
+    fi
+    # Only an executable file gets a launcher entry, and sync never makes one
+    # executable. Recorded before the write, so a failed write cannot make
+    # prune throw away the entry it already had.
+    [[ -x $file ]] || continue
+    written+=$'\n'"$id"
+    if write_desktop "$file" "$id"; then
       ((count++)) || true
     else
       echo "appimages: skipped $file" >&2
     fi
   done < <(appimage_files)
 
-  prune "$seen"
+  prune "$written" "$seen"
+  report_rejected "${rejected[@]}"
   command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
   (( quiet )) || notify "AppImages synced" "$count in $(basename "$(appimage_dir)")"
 }
 
 # TSV for the panel: id, name, file, icon, size, whether the name is a user
-# override, embedded version, window class, hidden, and whether a window of it
-# is open. Tabs cannot appear in any field, so no quoting is needed.
+# override, embedded version, window class, hidden, whether a window of it is
+# open, and whether it is allowed to run. Paths are restricted to SAFE_PATH_RE
+# and every other field has had its control characters removed, so a tab or a
+# newline cannot appear in any field and no quoting is needed.
 cmd_list() {
-  local file id name icon custom version wmclass hidden running classes seen=""
+  local file id name icon custom version wmclass hidden running trusted classes seen=""
 
   # One hyprctl call for the whole list rather than one per row.
   classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class // empty' | tr '[:upper:]' '[:lower:]' || true)
 
   while IFS= read -r -d '' file; do
+    safe_path "$file" || continue
     id=$(unique_id "$(id_for "$file")" "$seen")
     [[ -n $id ]] || continue
     seen+=$'\n'"$id"
@@ -517,9 +680,11 @@ cmd_list() {
     if [[ -n $wmclass ]] && grep -qxF "$(printf '%s' "$wmclass" | tr '[:upper:]' '[:lower:]')" <<<"$classes"; then
       running=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    trusted=0
+    [[ -x $file ]] && trusted=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$id" "$name" "$file" "$icon" "$(stat -c '%s' "$file")" "$custom" \
-      "$version" "$wmclass" "$hidden" "$running"
+      "$version" "$wmclass" "$hidden" "$running" "$trusted"
   done < <(appimage_files)
 }
 
@@ -555,7 +720,7 @@ cmd_rename() {
     name=$(omarchy-menu-input "Launcher name (empty resets to \"$(embedded_name "$id" "$file")\")") || exit 0
   fi
 
-  config_set "$id" name "$name"
+  config_set "$id" name "$(clean_line "$name" 128)"
   cmd_sync --quiet
   notify "Renamed" "$(display_name "$id" "$file")"
 }
@@ -585,6 +750,37 @@ cmd_delete() {
   notify "Deleted" "$(basename "$file")"
 }
 
+# The one place the plugin makes a file executable, and only on request. The
+# bit is set through a descriptor opened with O_NOFOLLOW on a regular file the
+# user owns, so a file swapped for a symlink between the listing and the chmod
+# cannot redirect it anywhere else. Only the owner's execute bit is added.
+cmd_trust() {
+  local id="${1:-}" file options=() selection
+  if [[ -z $id ]]; then
+    while IFS=$'\t' read -r row_id row_name row_file _ _ _ _ _ _ _ row_trusted; do
+      [[ $row_trusted == 0 ]] && options+=("$GLYPH"$'\t'"$row_name"$'\t'"$row_id")
+    done < <(cmd_list)
+    (( ${#options[@]} )) || { notify "Nothing to allow" "Every AppImage here may already run"; exit 0; }
+    selection=$(omarchy-menu-select "Allow to run" "${options[@]}") || exit 0
+    id=${selection##*$'\t'}
+  fi
+  file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
+  if ! /usr/bin/python3 -I - "$file" <<'PYEOF'
+import os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+    sys.exit(1)
+os.fchmod(fd, stat.S_IMODE(st.st_mode) | stat.S_IXUSR)
+PYEOF
+  then
+    echo "appimages: $file is not a regular file owned by you" >&2
+    exit 1
+  fi
+  cmd_sync --quiet
+  notify "Allowed to run" "$(display_name "$id" "$file")"
+}
+
 # setsid detaches the app from this script and from whatever called it, so it
 # survives an omarchy-shell restart. A non-zero exit within a few seconds is a
 # failure to start -- a missing FUSE, a broken image -- which would otherwise
@@ -592,6 +788,10 @@ cmd_delete() {
 cmd_run() {
   local id="${1:-}" file name log
   file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
+  if [[ ! -x $file ]]; then
+    echo "appimages: $id is not allowed to run yet; run: appimages trust $id" >&2
+    exit 1
+  fi
   name=$(display_name "$id" "$file")
   log=$(mktemp)
   setsid -f bash -c '
@@ -618,10 +818,12 @@ cmd_menu() {
   local choice
   choice=$(omarchy-menu-select "AppImages" \
     $'󰑐\t'"Sync now" \
+    $'󰕥\t'"Allow to run" \
     $'󰑕\t'"Rename" \
     $'󰉋\t'"Open folder") || exit 0
   case "$choice" in
     "Sync now") cmd_sync ;;
+    "Allow to run") cmd_trust ;;
     "Rename") cmd_rename ;;
     "Open folder") uwsm-app -- xdg-open "$(appimage_dir)" >/dev/null 2>&1 & ;;
   esac
@@ -638,12 +840,13 @@ case "${1:-sync}" in
   rename) shift; cmd_rename "$@" ;;
   hide) shift; cmd_hide "$@" ;;
   delete) shift; cmd_delete "$@" ;;
+  trust) shift; cmd_trust "$@" ;;
   run) shift; cmd_run "$@" ;;
   focus) shift; cmd_focus "$@" ;;
   menu) cmd_menu ;;
   *)
     echo "Usage: appimages [sync [--quiet] | list | dir | rename [id] [name]" >&2
-    echo "                 | hide <id> [on|off] | run <id> | focus <id> | delete <id> | menu]" >&2
+    echo "                 | hide <id> [on|off] | trust [id] | run <id> | focus <id> | delete <id> | menu]" >&2
     exit 1
     ;;
 esac

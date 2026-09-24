@@ -81,6 +81,12 @@ BarWidget {
     settleRefresh.restart()
   }
 
+  // Marks the file executable and gives it a launcher entry. Only ever called
+  // after the panel's confirmation dialog.
+  function trust(id) {
+    root.runAction(["trust", String(id)], id)
+  }
+
   function setHidden(id) {
     root.runAction(["hide", String(id)], id)
   }
@@ -228,6 +234,7 @@ BarWidget {
     // Not `hide`: that name already means "close the panel" on this target.
     function toggleHidden(id: string): void { root.setHidden(id) }
     function remove(id: string): void { root.remove(id) }
+    function trust(id: string): void { root.trust(id) }
   }
 
   WidgetButton {

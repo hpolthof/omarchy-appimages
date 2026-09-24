@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.hpolthof.appimages",
   "name": "AppImages",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "author": "Paul Olthof",
   "license": "MIT",
-  "description": "Drop an AppImage in a folder and it shows up in your launcher, with the name, icon, categories and window class it ships with -- read out of the image without running it. Rename any of them from the bar; the rename survives the next version of the AppImage. Removing the file removes the launcher entry again.",
+  "description": "Drop an AppImage in a folder and it shows up in your bar, with the name and icon it ships with -- read out of the image without running it. Allow it to run once and it gets a launcher entry; rename, hide or delete it from the bar. Nothing is made executable or run without your say-so.",
   "kinds": [
     "service",
     "bar-widget"

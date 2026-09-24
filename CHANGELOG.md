@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.0
+
+Security: nothing becomes runnable without the user, and every string that
+reaches a launcher entry is checked.
+
+- Sync no longer marks files executable. A new AppImage is shown in the panel
+  with its own name and icon but gets no launcher entry until the user allows
+  it to run (Enter or the shield button, then a confirmation). Allowing sets
+  only the owner's execute bit, through an `O_NOFOLLOW` descriptor on a regular
+  file the user owns. `run` refuses a file that is not allowed yet.
+- A file is only picked up when its full path matches a plain allow-list
+  (letters, digits, space and `._+@,()~-`, checked in the C locale). A name
+  with a newline, quote, `$`, `%` or anything else outside it could otherwise
+  inject keys or arguments into the generated entry; such files are skipped
+  with a one-time notification.
+- Icons given to the bar and launcher are always PNG, at most 1024×1024,
+  rewritten to IHDR/PLTE/tRNS/IDAT/IEND so no compressed ancillary chunk
+  survives. SVG icons are rasterised to a 256 px PNG inside the sandbox; XPM
+  is no longer accepted.
+- User overrides are checked too: the name is cleaned and its backslashes
+  escaped, `args` and `categories` must match an allow-list or are ignored.
+
+
 ## 1.1.1
 
 Security: the ELF header is validated before anything is read from it.

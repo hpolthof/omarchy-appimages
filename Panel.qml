@@ -50,6 +50,8 @@ Panel {
   // there is no keystroke or click that skips it.
   property string confirmId: ""
   property string confirmName: ""
+  // "delete" or "trust": the two things in this panel that ask first.
+  property string confirmKind: ""
   property bool confirmOpened: false
 
   function open() {
@@ -96,8 +98,22 @@ Panel {
   // either way the panel has served its purpose and gets out of the way.
   function activateRow(row) {
     if (!row || !root.hostWidget) return
+    // A file nobody has allowed to run gets a question, not a launch.
+    if (!row.trusted) {
+      root.askTrust(row)
+      return
+    }
     root.hostWidget.activate(row)
     root.close()
+  }
+
+  function askTrust(row) {
+    if (!row) return
+    root.confirmKind = "trust"
+    root.confirmId = row.id
+    root.confirmName = row.name
+    root.confirmOpened = true
+    confirmDialog.selectedIndex = 0
   }
 
   function toggleHidden(row) {
@@ -107,24 +123,30 @@ Panel {
 
   function askDelete(row) {
     if (!row) return
+    root.confirmKind = "delete"
     root.confirmId = row.id
     root.confirmName = row.name
     root.confirmOpened = true
     // selectedIndex on the dialog is only an initial value; reset it so a
     // previous confirm cannot leave the cursor sitting on Delete.
-    deleteConfirm.selectedIndex = 0
+    confirmDialog.selectedIndex = 0
   }
 
-  function confirmDelete() {
+  function confirmAction() {
     var id = root.confirmId
+    var kind = root.confirmKind
     root.confirmOpened = false
     root.confirmId = ""
-    if (id !== "" && root.hostWidget) root.hostWidget.remove(id)
+    root.confirmKind = ""
+    if (id === "" || !root.hostWidget) return
+    if (kind === "trust") root.hostWidget.trust(id)
+    else if (kind === "delete") root.hostWidget.remove(id)
   }
 
-  function cancelDelete() {
+  function cancelConfirm() {
     root.confirmOpened = false
     root.confirmId = ""
+    root.confirmKind = ""
   }
 
   function startEditing(id) {
@@ -423,10 +445,12 @@ Panel {
                   spacing: Style.spacing.xs
 
                   PanelActionButton {
-                    iconText: row.modelData.running ? Model.GLYPH.focus : Model.GLYPH.play
+                    iconText: !row.modelData.trusted ? Model.GLYPH.shield
+                      : row.modelData.running ? Model.GLYPH.focus : Model.GLYPH.play
                     foreground: row.modelData.running ? Color.accent : root.dim
                     hoverColor: Color.accent
-                    tooltipText: row.modelData.running ? "Focus  ·  Enter" : "Run  ·  Enter"
+                    tooltipText: !row.modelData.trusted ? "Allow to run  ·  Enter"
+                      : row.modelData.running ? "Focus  ·  Enter" : "Run  ·  Enter"
                     onClicked: root.activateRow(row.modelData)
                   }
 
@@ -507,19 +531,21 @@ Panel {
     }
 
     ConfirmDialog {
-      id: deleteConfirm
+      id: confirmDialog
       anchors.fill: parent
       opened: root.confirmOpened
       // Starts on Cancel, not the component's own default -- a stray Enter
-      // must never be the thing that deletes a file.
+      // must never be the thing that deletes a file or lets one run.
       selectedIndex: 0
-      message: "Delete " + root.confirmName + "? The AppImage file is removed from disk."
+      message: root.confirmKind === "trust"
+        ? "Allow " + root.confirmName + " to run? It becomes executable and gets a launcher entry. An AppImage can do anything you can, so only allow ones you trust."
+        : "Delete " + root.confirmName + "? The AppImage file is removed from disk."
       cancelText: "Cancel"
-      confirmText: "Delete"
+      confirmText: root.confirmKind === "trust" ? "Allow" : "Delete"
       foreground: root.foreground
       fontFamily: root.fontFamily
-      onCanceled: root.cancelDelete()
-      onConfirmed: root.confirmDelete()
+      onCanceled: root.cancelConfirm()
+      onConfirmed: root.confirmAction()
     }
 
     Item {
@@ -527,7 +553,7 @@ Panel {
       anchors.fill: parent
       visible: root.confirmOpened
       focus: root.confirmOpened
-      Keys.onPressed: function(event) { if (deleteConfirm.handleKey(event)) event.accepted = true }
+      Keys.onPressed: function(event) { if (confirmDialog.handleKey(event)) event.accepted = true }
     }
   }
 
