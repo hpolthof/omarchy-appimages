@@ -32,6 +32,8 @@ GLYPH="󰏖"
 MAX_ENTRY_BYTES=65536
 MAX_ICON_BYTES=4194304
 EXTRACT_SECONDS=30
+HEADER_SECONDS=5
+HEADER_MEMORY=$((128 * 1024 * 1024))
 
 notify() { command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g "$GLYPH" "$1" "${2:-}" || true; }
 
@@ -60,41 +62,99 @@ entry_get_localized() { [[ -f $1 ]] || return 0; grep -E "^$2\[[^]]+\]=" "$1" ||
 
 # The byte offset of the squashfs image inside a type-2 AppImage: an ELF
 # runtime with the image appended after its section header table, or after
-# its last segment when the table is missing. Sixty-four bytes of arithmetic;
-# nothing from the file runs.
+# its last segment when the table is missing.
+#
+# The header is attacker-controlled, so nothing in it is trusted before it is
+# checked: class, data encoding and version must be the ones ELF defines, the
+# header and entry sizes must be exactly what that class prescribes, the entry
+# count is capped far above anything a real runtime carries, and every offset
+# plus length is proven to lie inside the regular file before it is read.
+# Reads are fixed-size and at most 4 KB each; entries are read one at a time,
+# never as a table sized from the header. Python integers cannot overflow, so
+# the range arithmetic is exact. The helper itself runs isolated, with a clock
+# and an address-space cap, so even a bug here cannot become a memory bomb.
 squashfs_offset() {
-  python3 - "$1" <<'PYEOF'
-import struct, sys
-try:
-    with open(sys.argv[1], "rb") as fh:
-        e = fh.read(64)
-    if len(e) < 64 or e[:4] != b"\x7fELF":
-        sys.exit(1)
-    end = "<" if e[5] == 1 else ">"
-    if e[4] == 2:
+  timeout "$HEADER_SECONDS" prlimit --as="$HEADER_MEMORY" /usr/bin/python3 -I - "$1" <<'PYEOF'
+import os, stat, struct, sys
+
+# Real runtimes carry about ten program headers and a few dozen sections.
+MAX_PHNUM = 64
+MAX_SHNUM = 4096
+MAX_READ = 4096
+
+
+def main(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        return 1
+    size = st.st_size
+
+    def read_at(off, n):
+        if off < 0 or n < 0 or n > MAX_READ or off + n > size:
+            raise ValueError("range outside file")
+        os.lseek(fd, off, os.SEEK_SET)
+        b = os.read(fd, n)
+        if len(b) != n:
+            raise ValueError("short read")
+        return b
+
+    e = read_at(0, 64)
+    if e[:4] != b"\x7fELF":
+        return 1
+    cls, data, ident_version = e[4], e[5], e[6]
+    if cls not in (1, 2) or data not in (1, 2) or ident_version != 1:
+        return 1
+    end = "<" if data == 1 else ">"
+    (e_version,) = struct.unpack_from(end + "I", e, 0x14)
+    if cls == 2:
         phoff, shoff = struct.unpack_from(end + "QQ", e, 0x20)
-        phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHH", e, 0x36)
+        ehsize, phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHHH", e, 0x34)
+        want_ehsize, want_phentsize, want_shentsize = 64, 56, 64
     else:
         phoff, shoff = struct.unpack_from(end + "II", e, 0x1C)
-        phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHH", e, 0x2A)
-    candidates = [shoff + shentsize * shnum if shnum else 0]
-    with open(sys.argv[1], "rb") as fh:
-        fh.seek(phoff)
-        table = fh.read(phentsize * phnum)
-        for i in range(phnum):
-            ph = table[i * phentsize:(i + 1) * phentsize]
-            if len(ph) < phentsize:
-                break
-            if e[4] == 2:
-                p_offset, _, _, p_filesz = struct.unpack_from(end + "QQQQ", ph, 0x08)
-            else:
-                p_offset, _, _, p_filesz = struct.unpack_from(end + "IIII", ph, 0x04)
-            candidates.append(p_offset + p_filesz)
-        off = max(candidates)
-        fh.seek(off)
-        if fh.read(4) != b"hsqs":
-            sys.exit(1)
-    print(off)
+        ehsize, phentsize, phnum, shentsize, shnum = struct.unpack_from(end + "HHHHH", e, 0x28)
+        want_ehsize, want_phentsize, want_shentsize = 52, 32, 40
+    if e_version != 1 or ehsize != want_ehsize or phentsize != want_phentsize:
+        return 1
+    if phnum == 0 or phnum > MAX_PHNUM:
+        return 1
+    if phoff < ehsize or phoff + phentsize * phnum > size:
+        return 1
+
+    image_start = 0
+    if shnum:
+        if shentsize != want_shentsize or shnum > MAX_SHNUM:
+            return 1
+        if shoff < ehsize or shoff + shentsize * shnum > size:
+            return 1
+        image_start = shoff + shentsize * shnum
+
+    for i in range(phnum):
+        ph = read_at(phoff + i * phentsize, phentsize)
+        if cls == 2:
+            p_offset, _, _, p_filesz = struct.unpack_from(end + "QQQQ", ph, 0x08)
+        else:
+            p_offset, _, _, p_filesz = struct.unpack_from(end + "IIII", ph, 0x04)
+        if p_offset + p_filesz > size:
+            return 1
+        image_start = max(image_start, p_offset + p_filesz)
+
+    # A squashfs superblock is 96 bytes and says which version it is. Only a
+    # 4.0 image is handed to unsquashfs; anything else is not an AppImage.
+    if image_start + 96 > size:
+        return 1
+    sb = read_at(image_start, 96)
+    if sb[:4] != b"hsqs":
+        return 1
+    if struct.unpack_from("<HH", sb, 28) != (4, 0):
+        return 1
+    print(image_start)
+    return 0
+
+
+try:
+    sys.exit(main(sys.argv[1]))
 except Exception:
     sys.exit(1)
 PYEOF
@@ -104,9 +164,15 @@ PYEOF
 # the image read-only at /image, one scratch directory writable at /out, a
 # fresh /tmp, and a clock and an address-space cap around the whole thing. A
 # hostile image can make the parser fail or time out; it cannot run anything.
+#
+# Usage: sandboxed_unsquashfs FILE OFFSET OUT [unsquashfs options] -- [names]
+# unsquashfs reads everything after the filesystem argument as a name to
+# extract, so options and names are kept apart here.
 sandboxed_unsquashfs() {
-  local file="$1" offset="$2" out="$3"
+  local file="$1" offset="$2" out="$3" opts=()
   shift 3
+  while (( $# )) && [[ $1 != -- ]]; do opts+=("$1"); shift; done
+  [[ ${1:-} == -- ]] && shift
   timeout "$EXTRACT_SECONDS" prlimit --as=2147483648 --fsize="$MAX_ICON_BYTES" \
     bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 \
       --symlink usr/bin /bin --symlink usr/bin /sbin \
@@ -115,7 +181,14 @@ sandboxed_unsquashfs() {
       --ro-bind "$file" /image --bind "$out" /out \
       --unshare-all --die-with-parent --new-session --clearenv --chdir /tmp \
       -- unsquashfs -o "$offset" -d /out/x -no-xattrs -no-progress -quiet -p 1 \
-           -ignore-errors -f /image "$@" >/dev/null 2>&1
+           -ignore-errors -f "${opts[@]}" /image "$@" 2>/dev/null
+}
+
+# A path inside the image we are willing to ask for by name: relative, plain
+# characters, no ".." component, bounded length.
+image_path_ok() {
+  local p="$1"
+  [[ ${#p} -le 255 && $p =~ ^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$ && $p != *..* ]]
 }
 
 # Copies what we use from an untrusted desktop file and nothing else: the
@@ -195,7 +268,7 @@ appimage_files() {
 # without executing it. The fingerprint is recorded whatever happens, so an
 # image that cannot be read is looked at once, not on every sync.
 harvest() {
-  local file="$1" id="$2" state="$STATE_DIR/$id" fingerprint offset out src icon target
+  local file="$1" id="$2" state="$STATE_DIR/$id" fingerprint offset out listing entry src icon target
 
   fingerprint=$(stat -c '%s %Y' "$file")
   [[ $(cat "$state/fingerprint" 2>/dev/null) == "$fingerprint" ]] && return 0
@@ -204,7 +277,7 @@ harvest() {
   mkdir -p "$state"
   echo "$fingerprint" >"$state/fingerprint"
 
-  if ! command -v unsquashfs >/dev/null || ! command -v bwrap >/dev/null; then
+  if ! command -v unsquashfs >/dev/null || ! command -v bwrap >/dev/null || [[ ! -x /usr/bin/python3 ]]; then
     echo "no-tools" >"$state/status"
     return 0
   fi
@@ -214,42 +287,50 @@ harvest() {
   fi
 
   out=$(mktemp -d)
-  sandboxed_unsquashfs "$file" "$offset" "$out" '*.desktop' '.DirIcon' || true
 
-  src=$(find "$out/x" -maxdepth 1 -name '*.desktop' -type f 2>/dev/null | head -1)
-  if [[ -n $src ]] && (( $(stat -c '%s' "$src") <= MAX_ENTRY_BYTES )); then
-    accept_entry "$src" >"$state/entry.desktop"
+  # First a listing of the image root, capped in lines and line length, and
+  # from it two names: the entry, and what .DirIcon is or points at. Every
+  # extraction after this asks for one exact path, wildcards off, so at most
+  # three files ever come out of an image, each under the per-file size cap --
+  # a root directory of a million entries cannot fill the disk.
+  listing=$(sandboxed_unsquashfs "$file" "$offset" "$out" -lls -max-depth 1 -- | head -n 4000 | cut -c1-512 || true)
+  entry=$(printf '%s\n' "$listing" | awk -v max="$MAX_ENTRY_BYTES" \
+    '$1 ~ /^-/ && $6 ~ /^\/out\/x\/[A-Za-z0-9._-]+\.desktop$/ && $3 + 0 <= max { sub(/^\/out\/x\//, "", $6); print $6; exit }')
+  target=$(printf '%s\n' "$listing" | awk \
+    '$6 == "/out/x/.DirIcon" { if ($1 ~ /^l/ && $7 == "->") print $8; else if ($1 ~ /^-/) print ".DirIcon"; exit }')
+
+  if [[ -n $entry ]]; then
+    sandboxed_unsquashfs "$file" "$offset" "$out" -no-wildcards -- "$entry" >/dev/null || true
+    src="$out/x/$entry"
+    if [[ -f $src && ! -L $src ]] && (( $(stat -c '%s' "$src") <= MAX_ENTRY_BYTES )); then
+      accept_entry "$src" >"$state/entry.desktop"
+    fi
   fi
 
   # .DirIcon is the AppImage's own icon, usually a symlink into the image. The
-  # link comes out of the first pass; its target is fetched by exact name in a
-  # second, so a link can only ever point at something inside the image.
-  icon="$out/x/.DirIcon"
-  if [[ -L $icon ]]; then
-    target=$(readlink "$icon")
-    target=${target#/}
-    icon=""
-    if [[ $target != *..* && $target == [A-Za-z0-9._]* ]]; then
-      sandboxed_unsquashfs "$file" "$offset" "$out" "$target" || true
-      icon="$out/x/$target"
-    fi
+  # listing told us where it points; that path is fetched by exact name, so a
+  # link can only ever resolve to something inside the image.
+  icon=""
+  target=${target#/}
+  if [[ -n $target ]] && image_path_ok "$target"; then
+    sandboxed_unsquashfs "$file" "$offset" "$out" -no-wildcards -- "$target" >/dev/null || true
+    [[ -f "$out/x/$target" && ! -L "$out/x/$target" ]] && icon="$out/x/$target"
   fi
-  if [[ ! -f $icon ]]; then
+  if [[ -z $icon ]]; then
     # Second chance: the icon named by the entry, at the image root as the
     # AppImage spec requires. The name was validated to a plain filename.
     target=$(entry_get "$state/entry.desktop" Icon)
-    icon=""
-    if [[ -n $target ]]; then
-      sandboxed_unsquashfs "$file" "$offset" "$out" "$target.png" "$target.svg" "$target.xpm" || true
+    if [[ -n $target ]] && image_path_ok "$target"; then
+      sandboxed_unsquashfs "$file" "$offset" "$out" -no-wildcards -- "$target.png" "$target.svg" "$target.xpm" >/dev/null || true
       for ext in png svg xpm; do
-        [[ -f "$out/x/$target.$ext" ]] && { icon="$out/x/$target.$ext"; break; }
+        [[ -f "$out/x/$target.$ext" && ! -L "$out/x/$target.$ext" ]] && { icon="$out/x/$target.$ext"; break; }
       done
     fi
   fi
   [[ -n $icon && -f $icon ]] && accept_icon "$icon" "$state"
 
   rm -rf "$out"
-  echo "ok" >"$state/status"
+  if [[ -s $state/entry.desktop ]]; then echo "ok" >"$state/status"; else echo "no-entry" >"$state/status"; fi
 }
 
 # An icon is kept only when it is small enough and starts like a PNG, SVG or

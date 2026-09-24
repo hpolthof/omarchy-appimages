@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.1
+
+Security: the ELF header is validated before anything is read from it.
+
+- The header parser read the program header table in one go, sized from two
+  16-bit fields the file controls, so a crafted file in the folder could ask
+  for a multi-gigabyte allocation during sync, outside the extraction sandbox.
+  Class, encoding, version and the exact header and entry sizes are now
+  checked, entry counts are capped, every offset and length is proven to lie
+  inside the regular file, entries are read one at a time with reads of at
+  most 4 KB, and the helper runs isolated under a 128 MB address-space cap and
+  a five-second clock. The squashfs superblock must also say it is 4.0.
+- Extraction no longer uses wildcards. A capped listing of the image root
+  supplies the entry's name and `.DirIcon`'s target; each is then extracted by
+  exact name, so at most three files ever leave an image, each under the
+  per-file size cap.
+- An image that is readable but carries no usable entry now reports
+  `no-entry` rather than `ok`.
+
+
 ## 1.1.0
 
 Security: metadata is read out of an image, never by running it.

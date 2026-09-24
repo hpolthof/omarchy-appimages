@@ -18,11 +18,14 @@ AppImage.
   no login script.
 - **Reads the AppImage, never runs it.** Every AppImage carries its own
   desktop entry and icon in the squashfs image appended to its runtime. The
-  plugin finds that image from the ELF header and reads just those two files
-  out of it with `unsquashfs`, inside a `bubblewrap` sandbox with no network,
-  no home directory and a time and memory cap — a couple of hundred
-  milliseconds even on a 200MB image. Nothing in an AppImage executes until
-  you launch it. Everything the launcher searches on comes along —
+  plugin finds that image from the ELF header — every field of which is
+  validated and range-checked against the file before it is read, in a helper
+  that is itself capped at 128 MB and five seconds — and reads just those two
+  files out of it with `unsquashfs`, inside a `bubblewrap` sandbox with no
+  network, no home directory and a time and memory cap. Files are asked for
+  by exact name from a capped listing, so at most three ever leave an image,
+  each under a size cap. A couple of hundred milliseconds even on a 200MB
+  image. Nothing in an AppImage executes until you launch it. Everything the launcher searches on comes along —
   `GenericName`, `Keywords` and their translations — along with
   `StartupWMClass`, so Hyprland matches the window to the app.
 - **Trusts nothing it reads.** The entry's fields are taken one line at a
@@ -69,7 +72,7 @@ image: entries are named after the file and get a generic icon.
 
 | Used for | Needs |
 | --- | --- |
-| Reading the entry and icon out of an image | `unsquashfs` (`squashfs-tools`), `bwrap` (`bubblewrap`), `python3` |
+| Reading the entry and icon out of an image | `unsquashfs` (`squashfs-tools`), `bwrap` (`bubblewrap`), `/usr/bin/python3` |
 | Reading and writing the override file | `jq` |
 | Watching the folder | `inotifywait` (`inotify-tools`) |
 | Seeing which AppImages have a window open | `hyprctl` |
@@ -224,7 +227,7 @@ To reach it from the Omarchy menu instead, add this to
 | Path | Contents |
 | --- | --- |
 | `~/.local/share/applications/appimage-*.desktop` | The launcher entries. Each carries `X-AppImage-File`, which is how the plugin recognises its own and cleans them up. |
-| `~/.local/state/appimages/<id>/` | Cached icon, the accepted copy of the embedded desktop entry, a status (`ok`, `no-image`, `no-tools`), and the size+mtime fingerprint that lets a no-op sync stay a no-op. |
+| `~/.local/state/appimages/<id>/` | Cached icon, the accepted copy of the embedded desktop entry, a status (`ok`, `no-entry`, `no-image`, `no-tools`), and the size+mtime fingerprint that lets a no-op sync stay a no-op. |
 | `~/.config/omarchy/appimages.json` | Your overrides. |
 
 Nothing else on the system is touched, no AppImage is ever modified, and no
