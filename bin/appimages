@@ -786,24 +786,22 @@ PYEOF
 # failure to start -- a missing FUSE, a broken image -- which would otherwise
 # vanish without a word; a non-zero exit later is just how the user quit.
 cmd_run() {
-  local id="${1:-}" file name log
+  local id="${1:-}" file name
   file=$(file_for_id "$id") || { echo "appimages: no such AppImage: $id" >&2; exit 1; }
   if [[ ! -x $file ]]; then
     echo "appimages: $id is not allowed to run yet; run: appimages trust $id" >&2
     exit 1
   fi
   name=$(display_name "$id" "$file")
-  log=$(mktemp)
   setsid -f bash -c '
-    file="$1"; log="$2"; name="$3"; glyph="$4"
+    file="$1"; name="$2"; glyph="$3"
     start=$(date +%s)
-    "$file" >"$log" 2>&1
+    last_line=$(set -o pipefail; "$file" 2>&1 | tail -n 1)
     code=$?
     if (( code != 0 && $(date +%s) - start < 5 )); then
-      omarchy-notification-send -u critical -g "$glyph" "$name did not start" "$(tail -n 1 "$log")"
+      omarchy-notification-send -u critical -g "$glyph" "$name did not start" "$last_line"
     fi
-    rm -f "$log"
-  ' _ "$file" "$log" "$name" "$GLYPH" >/dev/null 2>&1
+  ' _ "$file" "$name" "$GLYPH" >/dev/null 2>&1
 }
 
 cmd_focus() {
