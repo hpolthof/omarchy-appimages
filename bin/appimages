@@ -796,10 +796,10 @@ cmd_run() {
   setsid -f bash -c '
     file="$1"; name="$2"; glyph="$3"
     start=$(date +%s)
-    last_line=$(set -o pipefail; "$file" 2>&1 | tail -n 1)
+    "$file" >/dev/null 2>&1
     code=$?
     if (( code != 0 && $(date +%s) - start < 5 )); then
-      omarchy-notification-send -u critical -g "$glyph" "$name did not start" "$last_line"
+      omarchy-notification-send -u critical -g "$glyph" "$name did not start"
     fi
   ' _ "$file" "$name" "$GLYPH" >/dev/null 2>&1
 }
