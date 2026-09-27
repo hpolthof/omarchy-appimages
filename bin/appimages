@@ -559,6 +559,8 @@ prune() {
   for entry in "$DESKTOP_DIR/$PREFIX"*.desktop; do
     [[ -e $entry ]] || continue
     id=$(basename "$entry" .desktop | sed "s/^$PREFIX//")
+    # Only touch entries we own; another tool may use the same prefix.
+    [[ -d "$STATE_DIR/$id" ]] || continue
     [[ $'\n'$written$'\n' == *$'\n'$id$'\n'* ]] && continue
     rm -f "$entry"
   done
