@@ -449,7 +449,8 @@ try:
         if ctype == b"IEND":
             break
     tmp = dst + ".part"
-    with open(tmp, "wb") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "wb") as fh:
         fh.write(b"".join(out))
     os.replace(tmp, dst)
 except SystemExit:
@@ -488,6 +489,17 @@ write_desktop() {
   local out="$DESKTOP_DIR/$PREFIX$id.desktop"
   local name generic comment categories mime wmclass icon args keywords version
 
+  # Refuse a symlink at the output path; it would redirect the write.
+  if [[ -L "$out" ]]; then
+    echo "appimages: $out is a symlink; skipping" >&2
+    return 1
+  fi
+  # Refuse to overwrite a file another tool created.
+  if [[ -e "$out" ]] && ! grep -qF 'X-AppImages-Managed=true' "$out" 2>/dev/null; then
+    echo "appimages: $out exists but was not created by this plugin; skipping" >&2
+    return 1
+  fi
+
   name=$(display_name "$id" "$file")
   # A name typed by the user is plain text; in a desktop file a backslash
   # starts an escape, so it is doubled. Names from the image keep theirs --
@@ -512,6 +524,7 @@ write_desktop() {
   icon=$(icon_path "$id")
   [[ -n $icon ]] || icon="application-x-executable"
 
+  local tmp="$out.$$.part"
   {
     echo "[Desktop Entry]"
     echo "Version=1.0"
@@ -537,10 +550,9 @@ write_desktop() {
     [[ $(override "$id" hidden) == true ]] && echo "NoDisplay=true"
     echo "X-AppImage-File=$file"
     [[ -n $version ]] && echo "X-AppImage-Version=$version"
-    # The block's status is the function's; an optional last line must not
-    # turn a fully written entry into a "skipped" one.
+    echo "X-AppImages-Managed=true"
     :
-  } >"$out"
+  } >"$tmp" && mv -- "$tmp" "$out" || { rm -f "$tmp"; return 1; }
 }
 
 # One line, no control characters, at most $2 characters.
