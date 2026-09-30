@@ -524,7 +524,8 @@ write_desktop() {
   icon=$(icon_path "$id")
   [[ -n $icon ]] || icon="application-x-executable"
 
-  local tmp="$out.$$.part"
+  local tmp
+  tmp=$(mktemp -- "${out}.XXXXXX") || return 1
   {
     echo "[Desktop Entry]"
     echo "Version=1.0"
