@@ -572,8 +572,11 @@ prune() {
   for entry in "$DESKTOP_DIR/$PREFIX"*.desktop; do
     [[ -e $entry ]] || continue
     id=$(basename "$entry" .desktop | sed "s/^$PREFIX//")
-    # Only touch entries we own; another tool may use the same prefix.
+    # Only touch entries we own: state dir exists AND the file carries our marker.
+    # The state dir is created for every AppImage seen (including non-executable
+    # ones), so it alone is not proof that we wrote this specific desktop file.
     [[ -d "$STATE_DIR/$id" ]] || continue
+    grep -qF 'X-AppImages-Managed=true' "$entry" 2>/dev/null || continue
     [[ $'\n'$written$'\n' == *$'\n'$id$'\n'* ]] && continue
     rm -f "$entry"
   done
