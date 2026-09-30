@@ -401,6 +401,7 @@ Panel {
                     width: parent.width
                     visible: root.editingId !== row.modelData.id
                     text: row.modelData.name
+                    textFormat: Text.PlainText
                     // A hidden AppImage is still here, it just is not on
                     // offer; the row says so by receding rather than shouting.
                     color: row.modelData.hidden ? root.faint : root.foreground
@@ -432,6 +433,7 @@ Panel {
                   Text {
                     width: parent.width
                     text: Model.detailLine(row.modelData)
+                    textFormat: Text.PlainText
                     color: root.faint
                     elide: Text.ElideRight
                     font.family: root.fontFamily
